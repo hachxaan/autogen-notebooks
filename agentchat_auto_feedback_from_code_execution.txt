@@ -1,0 +1,672 @@
+<a href="https://colab.research.google.com/github/microsoft/autogen/blob/main/notebook/agentchat_auto_feedback_from_code_execution.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+# Auto Generated Agent Chat: Task Solving with Code Generation, Execution & Debugging
+
+AutoGen offers conversable LLM agents, which can be used to solve various tasks with human or automatic feedback, including tasks that require using tools via code.
+Please find documentation about this feature [here](https://microsoft.github.io/autogen/docs/Use-Cases/agent_chat).
+
+In this notebook, we demonstrate how to use `AssistantAgent` and `UserProxyAgent` to write code and execute the code. Here `AssistantAgent` is an LLM-based agent that can write Python code (in a Python coding block) for a user to execute for a given task. `UserProxyAgent` is an agent which serves as a proxy for the human user to execute the code written by `AssistantAgent`, or automatically execute the code. Depending on the setting of `human_input_mode` and `max_consecutive_auto_reply`, the `UserProxyAgent` either solicits feedback from the human user or returns auto-feedback based on the result of code execution (success or failure and corresponding outputs) to `AssistantAgent`. `AssistantAgent` will debug the code and suggest new code if the result contains error. The two agents keep communicating to each other until the task is done.
+
+## Requirements
+
+AutoGen requires `Python>=3.8`. To run this notebook example, please install:
+```bash
+pip install pyautogen
+```
+
+
+```python
+# %pip install pyautogen~=0.2.0b4
+```
+
+## Set your API Endpoint
+
+The [`config_list_from_json`](https://microsoft.github.io/autogen/docs/reference/oai/openai_utils#config_list_from_json) function loads a list of configurations from an environment variable or a json file.
+
+
+
+```python
+import autogen
+
+config_list = autogen.config_list_from_json(
+    "OAI_CONFIG_LIST",
+    filter_dict={
+        "model": ["gpt-4", "gpt-4-0314", "gpt4", "gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-v0314"],
+    },
+)
+```
+
+It first looks for environment variable "OAI_CONFIG_LIST" which needs to be a valid json string. If that variable is not found, it then looks for a json file named "OAI_CONFIG_LIST". It filters the configs by models (you can filter by other keys as well). Only the gpt-4 models are kept in the list based on the filter condition.
+
+The config list looks like the following:
+```python
+config_list = [
+    {
+        'model': 'gpt-4',
+        'api_key': '<your OpenAI API key here>',
+    },
+    {
+        'model': 'gpt-4',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+    {
+        'model': 'gpt-4-32k',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+]
+```
+
+You can set the value of config_list in any way you prefer. Please refer to this [notebook](https://github.com/microsoft/autogen/blob/main/notebook/oai_openai_utils.ipynb) for full code examples of the different methods.
+
+## Example Task: Check Stock Price Change
+
+In the example below, let's see how to use the agents in AutoGen to write a python script and execute the script. This process involves constructing a `AssistantAgent` to serve as the assistant, along with a `UserProxyAgent` that acts as a proxy for the human user. In this example demonstrated below, when constructing the `UserProxyAgent`,  we select the `human_input_mode` to "NEVER". This means that the `UserProxyAgent` will not solicit feedback from the human user. It stops replying when the limit defined by `max_consecutive_auto_reply` is reached, or when `is_termination_msg()` returns true for the received message.
+
+
+```python
+# create an AssistantAgent named "assistant"
+assistant = autogen.AssistantAgent(
+    name="assistant",
+    llm_config={
+        "cache_seed": 42,  # seed for caching and reproducibility
+        "config_list": config_list,  # a list of OpenAI API configurations
+        "temperature": 0,  # temperature for sampling
+    },  # configuration for autogen's enhanced inference API which is compatible with OpenAI API
+)
+# create a UserProxyAgent instance named "user_proxy"
+user_proxy = autogen.UserProxyAgent(
+    name="user_proxy",
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=10,
+    is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE"),
+    code_execution_config={
+        "work_dir": "coding",
+        "use_docker": False,  # set to True or image name like "python:3" to use docker
+    },
+)
+# the assistant receives a message from the user_proxy, which contains the task description
+user_proxy.initiate_chat(
+    assistant,
+    message="""What date is today? Compare the year-to-date gain for META and TESLA.""",
+)
+```
+
+    [33muser_proxy[0m (to assistant):
+    
+    What date is today? Compare the year-to-date gain for META and TESLA.
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    First, let's find out today's date. Then, we will fetch the stock prices for META (Facebook) and TESLA and calculate the year-to-date gain for both.
+    
+    Step 1: Get today's date
+    ```python
+    from datetime import date
+    today = date.today()
+    print("Today's date:", today)
+    ```
+    
+    Step 2: Fetch stock prices for META and TESLA
+    We will use the `yfinance` library to fetch the stock prices. If you don't have it installed, please install it using the following command:
+    
+    ```sh
+    pip install yfinance
+    ```
+    
+    Step 3: Calculate the year-to-date gain for META and TESLA
+    ```python
+    import yfinance as yf
+    from datetime import datetime
+    
+    def get_ytd_gain(ticker):
+        stock = yf.Ticker(ticker)
+        start_date = datetime(today.year, 1, 1)
+        end_date = today
+        historical_data = stock.history(start=start_date, end=end_date)
+        start_price = historical_data.iloc[0]['Close']
+        end_price = historical_data.iloc[-1]['Close']
+        ytd_gain = (end_price - start_price) / start_price * 100
+        return ytd_gain
+    
+    meta_ytd_gain = get_ytd_gain("FB")
+    tesla_ytd_gain = get_ytd_gain("TSLA")
+    
+    print(f"Year-to-date gain for META (Facebook): {meta_ytd_gain:.2f}%")
+    print(f"Year-to-date gain for TESLA: {tesla_ytd_gain:.2f}%")
+    ```
+    
+    Please execute the code blocks in the order mentioned above.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 1 (inferred language is sh)...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 2 (inferred language is python)...[0m
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 1 (execution failed)
+    Code output: 
+    Today's date: 2023-08-29
+    
+    Defaulting to user installation because normal site-packages is not writeable
+    Requirement already satisfied: yfinance in /home/vscode/.local/lib/python3.9/site-packages (0.2.26)
+    Requirement already satisfied: numpy>=1.16.5 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.25.1)
+    Requirement already satisfied: requests>=2.31 in /usr/local/lib/python3.9/site-packages (from yfinance) (2.31.0)
+    Requirement already satisfied: lxml>=4.9.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (4.9.3)
+    Requirement already satisfied: pytz>=2022.5 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (2023.3)
+    Requirement already satisfied: frozendict>=2.3.4 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (2.3.8)
+    Requirement already satisfied: multitasking>=0.0.7 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (0.0.11)
+    Requirement already satisfied: beautifulsoup4>=4.11.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (4.12.2)
+    Requirement already satisfied: pandas>=1.3.0 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.3.3)
+    Requirement already satisfied: html5lib>=1.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.1)
+    Requirement already satisfied: appdirs>=1.4.4 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.4.4)
+    Requirement already satisfied: soupsieve>1.2 in /home/vscode/.local/lib/python3.9/site-packages (from beautifulsoup4>=4.11.1->yfinance) (2.4.1)
+    Requirement already satisfied: six>=1.9 in /usr/local/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (1.16.0)
+    Requirement already satisfied: webencodings in /home/vscode/.local/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (0.5.1)
+    Requirement already satisfied: python-dateutil>=2.7.3 in /home/vscode/.local/lib/python3.9/site-packages (from pandas>=1.3.0->yfinance) (2.8.2)
+    Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2023.5.7)
+    Requirement already satisfied: charset-normalizer<4,>=2 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.2.0)
+    Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2.0.3)
+    Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.4)
+    
+    Traceback (most recent call last):
+      File "", line 14, in <module>
+        meta_ytd_gain = get_ytd_gain("FB")
+      File "", line 6, in get_ytd_gain
+        start_date = datetime(today.year, 1, 1)
+    NameError: name 'today' is not defined
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    Apologies for the error. It seems I forgot to include the `today` variable in the last code block. Here's the corrected code:
+    
+    ```python
+    import yfinance as yf
+    from datetime import datetime, date
+    
+    today = date.today()
+    
+    def get_ytd_gain(ticker):
+        stock = yf.Ticker(ticker)
+        start_date = datetime(today.year, 1, 1)
+        end_date = today
+        historical_data = stock.history(start=start_date, end=end_date)
+        start_price = historical_data.iloc[0]['Close']
+        end_price = historical_data.iloc[-1]['Close']
+        ytd_gain = (end_price - start_price) / start_price * 100
+        return ytd_gain
+    
+    meta_ytd_gain = get_ytd_gain("FB")
+    tesla_ytd_gain = get_ytd_gain("TSLA")
+    
+    print(f"Year-to-date gain for META (Facebook): {meta_ytd_gain:.2f}%")
+    print(f"Year-to-date gain for TESLA: {tesla_ytd_gain:.2f}%")
+    ```
+    
+    Please execute this code block to get the year-to-date gain for META and TESLA.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 1 (execution failed)
+    Code output: 
+    FB: No timezone found, symbol may be delisted
+    Traceback (most recent call last):
+      File "", line 16, in <module>
+        meta_ytd_gain = get_ytd_gain("FB")
+      File "", line 11, in get_ytd_gain
+        start_price = historical_data.iloc[0]['Close']
+      File "/home/vscode/.local/lib/python3.9/site-packages/pandas/core/indexing.py", line 931, in __getitem__
+        return self._getitem_axis(maybe_callable, axis=axis)
+      File "/home/vscode/.local/lib/python3.9/site-packages/pandas/core/indexing.py", line 1566, in _getitem_axis
+        self._validate_integer(key, axis)
+      File "/home/vscode/.local/lib/python3.9/site-packages/pandas/core/indexing.py", line 1500, in _validate_integer
+        raise IndexError("single positional indexer is out-of-bounds")
+    IndexError: single positional indexer is out-of-bounds
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    I apologize for the error. It seems that the "FB" ticker symbol is not working as expected. Facebook has changed its parent company name to Meta Platforms, Inc., and its ticker symbol has been changed to "META". Let's update the code to use the new ticker symbol:
+    
+    ```python
+    import yfinance as yf
+    from datetime import datetime, date
+    
+    today = date.today()
+    
+    def get_ytd_gain(ticker):
+        stock = yf.Ticker(ticker)
+        start_date = datetime(today.year, 1, 1)
+        end_date = today
+        historical_data = stock.history(start=start_date, end=end_date)
+        start_price = historical_data.iloc[0]['Close']
+        end_price = historical_data.iloc[-1]['Close']
+        ytd_gain = (end_price - start_price) / start_price * 100
+        return ytd_gain
+    
+    meta_ytd_gain = get_ytd_gain("META")
+    tesla_ytd_gain = get_ytd_gain("TSLA")
+    
+    print(f"Year-to-date gain for META (Facebook): {meta_ytd_gain:.2f}%")
+    print(f"Year-to-date gain for TESLA: {tesla_ytd_gain:.2f}%")
+    ```
+    
+    Please execute this updated code block to get the year-to-date gain for META and TESLA.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    Year-to-date gain for META (Facebook): 132.69%
+    Year-to-date gain for TESLA: 120.93%
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    Great! The code executed successfully. Here are the year-to-date gains for META (Facebook) and TESLA:
+    
+    - Year-to-date gain for META (Facebook): 132.69%
+    - Year-to-date gain for TESLA: 120.93%
+    
+    Please note that these values are based on the stock market data at the time of execution and may change as the market fluctuates.
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
+
+The example above involves code execution. In AutoGen, code execution is triggered automatically by the `UserProxyAgent` when it detects an executable code block in a received message and no human user input is provided. This process occurs in a designated working directory, using a Docker container by default. Unless a specific directory is specified, AutoGen defaults to the `autogen/extensions` directory. Users have the option to specify a different working directory by setting the `work_dir` argument when constructing a new instance of the `UserProxyAgent`.
+
+The whole chat is auto-generated.
+
+## Example Task: Plot Chart
+
+
+```python
+# followup of the previous question
+user_proxy.send(
+    recipient=assistant,
+    message="""Plot a chart of their stock price change YTD and save to stock_price_ytd.png.""",
+)
+```
+
+    [33muser_proxy[0m (to assistant):
+    
+    Plot a chart of their stock price change YTD and save to stock_price_ytd.png.
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    To plot the chart and save it as an image, we will use the `matplotlib` library. If you don't have it installed, please install it using the following command:
+    
+    ```sh
+    pip install matplotlib
+    ```
+    
+    Now, let's plot the chart of the stock price change YTD for META and TESLA and save it to a file named "stock_price_ytd.png":
+    
+    ```python
+    # filename: plot_stock_price_ytd.py
+    
+    import yfinance as yf
+    import matplotlib.pyplot as plt
+    from datetime import datetime, date
+    
+    today = date.today()
+    
+    def get_stock_data(ticker):
+        stock = yf.Ticker(ticker)
+        start_date = datetime(today.year, 1, 1)
+        end_date = today
+        historical_data = stock.history(start=start_date, end=end_date)
+        return historical_data
+    
+    meta_data = get_stock_data("META")
+    tesla_data = get_stock_data("TSLA")
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(meta_data.index, meta_data['Close'], label='META (Facebook)')
+    plt.plot(tesla_data.index, tesla_data['Close'], label='TESLA')
+    plt.xlabel('Date')
+    plt.ylabel('Stock Price')
+    plt.title('Stock Price Change YTD for META and TESLA')
+    plt.legend()
+    plt.savefig('stock_price_ytd.png')
+    plt.show()
+    ```
+    
+    Please save the above code in a file named "plot_stock_price_ytd.py" and execute it using the following command:
+    
+    ```sh
+    python plot_stock_price_ytd.py
+    ```
+    
+    This will create a chart of the stock price change YTD for META and TESLA and save it as "stock_price_ytd.png" in the same directory where the script is located.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is sh)...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 1 (inferred language is python)...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 2 (inferred language is sh)...[0m
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    Defaulting to user installation because normal site-packages is not writeable
+    Requirement already satisfied: matplotlib in /home/vscode/.local/lib/python3.9/site-packages (3.7.2)
+    Requirement already satisfied: fonttools>=4.22.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (4.41.1)
+    Requirement already satisfied: kiwisolver>=1.0.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (1.4.4)
+    Requirement already satisfied: cycler>=0.10 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (0.11.0)
+    Requirement already satisfied: pillow>=6.2.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (10.0.0)
+    Requirement already satisfied: importlib-resources>=3.2.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (6.0.0)
+    Requirement already satisfied: python-dateutil>=2.7 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (2.8.2)
+    Requirement already satisfied: pyparsing<3.1,>=2.3.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (3.0.9)
+    Requirement already satisfied: packaging>=20.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (23.1)
+    Requirement already satisfied: contourpy>=1.0.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (1.1.0)
+    Requirement already satisfied: numpy>=1.20 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (1.25.1)
+    Requirement already satisfied: zipp>=3.1.0 in /home/vscode/.local/lib/python3.9/site-packages (from importlib-resources>=3.2.0->matplotlib) (3.16.2)
+    Requirement already satisfied: six>=1.5 in /usr/local/lib/python3.9/site-packages (from python-dateutil>=2.7->matplotlib) (1.16.0)
+    
+    Figure(1200x600)
+    
+    Figure(1200x600)
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    Great! The code executed successfully, and the chart of the stock price change YTD for META and TESLA has been saved as "stock_price_ytd.png" in the same directory where the script is located. You can now view the chart by opening the "stock_price_ytd.png" file.
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
+
+Let's display the generated figure.
+
+
+```python
+from IPython.display import Image
+
+Image(filename='coding/stock_price_ytd.png')
+```
+
+
+
+
+    
+![png](output_12_0.png)
+    
+
+
+
+## Use a Different Code Execution Environment
+
+The code execution happened in a separate process, so the plot is not directly displayed in the notebook. Is it possible to change the code execution environment into IPython?
+
+Yes! In the following we demonstrate how to extend the `UserProxyAgent` to use a different code execution environment.
+
+
+```python
+from typing import Dict, Union
+from IPython import get_ipython
+
+class IPythonUserProxyAgent(autogen.UserProxyAgent):
+    def __init__(self, name: str, **kwargs):
+        super().__init__(name, **kwargs)
+        self._ipython = get_ipython()
+
+    def generate_init_message(self, *args, **kwargs) -> Union[str, Dict]:
+        return super().generate_init_message(*args, **kwargs) + """
+If you suggest code, the code will be executed in IPython."""
+
+    def run_code(self, code, **kwargs):
+        result = self._ipython.run_cell("%%capture --no-display cap\n" + code)
+        log = self._ipython.ev("cap.stdout")
+        log += self._ipython.ev("cap.stderr")
+        if result.result is not None:
+            log += str(result.result)
+        exitcode = 0 if result.success else 1
+        if result.error_before_exec is not None:
+            log += f"\n{result.error_before_exec}"
+            exitcode = 1
+        if result.error_in_exec is not None:
+            log += f"\n{result.error_in_exec}"
+            exitcode = 1
+        return exitcode, log, None
+```
+
+The implementation overrides three functions in `UserProxyAgent`:
+* constructor. We get the ipython instance as the code execution environment.
+* `generate_init_message`. We generate a modified initial message to send to the assistant agent, by adding the info that the execution will be performed in IPython.
+* `run_code`. We execute the code with the ipython instance.
+
+With the new `IPythonUserProxyAgent`, we are able to run the code within the current notebook environment and display the plot directly.
+
+
+```python
+ipy_user = IPythonUserProxyAgent(
+    "ipython_user_proxy",
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=10,
+    is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE") or x.get("content", "").rstrip().endswith('"TERMINATE".'),
+)
+# the assistant receives a message from the user, which contains the task description
+ipy_user.initiate_chat(
+    assistant,
+    message="""Plot a chart of META and TESLA stock price gain YTD""",
+)
+```
+
+    [33mipython_user_proxy[0m (to assistant):
+    
+    Plot a chart of META and TESLA stock price gain YTD
+    If you suggest code, the code will be executed in IPython.
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to ipython_user_proxy):
+    
+    First, we need to install the necessary libraries to fetch stock data and plot the chart. Please execute the following code to install the required libraries:
+    
+    ```python
+    !pip install yfinance matplotlib
+    ```
+    
+    After installing the libraries, execute the following code to fetch the stock data and plot the chart:
+    
+    ```python
+    import yfinance as yf
+    import matplotlib.pyplot as plt
+    import datetime
+    
+    # Get the current date
+    today = datetime.date.today()
+    
+    # Calculate the start date for YTD
+    start_date = datetime.date(today.year, 1, 1)
+    
+    # Fetch stock data for META (Facebook) and TESLA
+    meta = yf.download('FB', start=start_date, end=today)
+    tesla = yf.download('TSLA', start=start_date, end=today)
+    
+    # Calculate the percentage gain for each stock
+    meta['Gain'] = (meta['Close'] / meta['Close'][0]) * 100
+    tesla['Gain'] = (tesla['Close'] / tesla['Close'][0]) * 100
+    
+    # Plot the chart
+    plt.figure(figsize=(12, 6))
+    plt.plot(meta.index, meta['Gain'], label='META (Facebook)')
+    plt.plot(tesla.index, tesla['Gain'], label='TESLA')
+    plt.xlabel('Date')
+    plt.ylabel('Percentage Gain YTD')
+    plt.title('META (Facebook) vs TESLA Stock Price Gain YTD')
+    plt.legend()
+    plt.grid()
+    plt.show()
+    ```
+    
+    This code will fetch the stock data for META (Facebook) and TESLA from the start of the year to the current date, calculate the percentage gain, and plot the chart.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 1 (inferred language is python)...[0m
+
+
+
+    ---------------------------------------------------------------------------
+
+    IndexError                                Traceback (most recent call last)
+
+    Cell In[7], line 16
+         13 tesla = yf.download('TSLA', start=start_date, end=today)
+         15 # Calculate the percentage gain for each stock
+    ---> 16 meta['Gain'] = (meta['Close'] / meta['Close'][0]) * 100
+         17 tesla['Gain'] = (tesla['Close'] / tesla['Close'][0]) * 100
+         19 # Plot the chart
+
+
+    File ~/.local/lib/python3.9/site-packages/pandas/core/series.py:939, in Series.__getitem__(self, key)
+        936     key = unpack_1tuple(key)
+        938 if is_integer(key) and self.index._should_fallback_to_positional():
+    --> 939     return self._values[key]
+        941 elif key_is_scalar:
+        942     return self._get_value(key)
+
+
+    IndexError: index 0 is out of bounds for axis 0 with size 0
+
+
+    [33mipython_user_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    Defaulting to user installation because normal site-packages is not writeable
+    Requirement already satisfied: yfinance in /home/vscode/.local/lib/python3.9/site-packages (0.2.26)
+    Requirement already satisfied: matplotlib in /home/vscode/.local/lib/python3.9/site-packages (3.7.2)
+    Requirement already satisfied: html5lib>=1.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.1)
+    Requirement already satisfied: pytz>=2022.5 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (2023.3)
+    Requirement already satisfied: frozendict>=2.3.4 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (2.3.8)
+    Requirement already satisfied: pandas>=1.3.0 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.3.3)
+    Requirement already satisfied: lxml>=4.9.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (4.9.3)
+    Requirement already satisfied: numpy>=1.16.5 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.25.1)
+    Requirement already satisfied: appdirs>=1.4.4 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (1.4.4)
+    Requirement already satisfied: beautifulsoup4>=4.11.1 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (4.12.2)
+    Requirement already satisfied: requests>=2.31 in /usr/local/lib/python3.9/site-packages (from yfinance) (2.31.0)
+    Requirement already satisfied: multitasking>=0.0.7 in /home/vscode/.local/lib/python3.9/site-packages (from yfinance) (0.0.11)
+    Requirement already satisfied: kiwisolver>=1.0.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (1.4.4)
+    Requirement already satisfied: importlib-resources>=3.2.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (6.0.0)
+    Requirement already satisfied: pillow>=6.2.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (10.0.0)
+    Requirement already satisfied: python-dateutil>=2.7 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (2.8.2)
+    Requirement already satisfied: fonttools>=4.22.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (4.41.1)
+    Requirement already satisfied: pyparsing<3.1,>=2.3.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (3.0.9)
+    Requirement already satisfied: packaging>=20.0 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (23.1)
+    Requirement already satisfied: contourpy>=1.0.1 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (1.1.0)
+    Requirement already satisfied: cycler>=0.10 in /home/vscode/.local/lib/python3.9/site-packages (from matplotlib) (0.11.0)
+    Requirement already satisfied: soupsieve>1.2 in /home/vscode/.local/lib/python3.9/site-packages (from beautifulsoup4>=4.11.1->yfinance) (2.4.1)
+    Requirement already satisfied: six>=1.9 in /usr/local/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (1.16.0)
+    Requirement already satisfied: webencodings in /home/vscode/.local/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (0.5.1)
+    Requirement already satisfied: zipp>=3.1.0 in /home/vscode/.local/lib/python3.9/site-packages (from importlib-resources>=3.2.0->matplotlib) (3.16.2)
+    Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.4)
+    Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2.0.3)
+    Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2023.5.7)
+    Requirement already satisfied: charset-normalizer<4,>=2 in /usr/local/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.2.0)
+    
+    [1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m A new release of pip is available: [0m[31;49m23.0.1[0m[39;49m -> [0m[32;49m23.2.1[0m
+    [1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m To update, run: [0m[32;49mpip install --upgrade pip[0m
+    
+    [*********************100%***********************]  1 of 1 completed
+    [*********************100%***********************]  1 of 1 completed
+    
+    1 Failed download:
+    ['FB']: Exception('%ticker%: No timezone found, symbol may be delisted')
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to ipython_user_proxy):
+    
+    It seems that there was an issue with fetching the stock data for META (Facebook) using the ticker symbol 'FB'. The stock symbol for META has been changed to 'META' recently. Let's update the code to use the new symbol and try again:
+    
+    ```python
+    import yfinance as yf
+    import matplotlib.pyplot as plt
+    import datetime
+    
+    # Get the current date
+    today = datetime.date.today()
+    
+    # Calculate the start date for YTD
+    start_date = datetime.date(today.year, 1, 1)
+    
+    # Fetch stock data for META (Facebook) and TESLA
+    meta = yf.download('META', start=start_date, end=today)
+    tesla = yf.download('TSLA', start=start_date, end=today)
+    
+    # Calculate the percentage gain for each stock
+    meta['Gain'] = (meta['Close'] / meta['Close'][0]) * 100
+    tesla['Gain'] = (tesla['Close'] / tesla['Close'][0]) * 100
+    
+    # Plot the chart
+    plt.figure(figsize=(12, 6))
+    plt.plot(meta.index, meta['Gain'], label='META (Facebook)')
+    plt.plot(tesla.index, tesla['Gain'], label='TESLA')
+    plt.xlabel('Date')
+    plt.ylabel('Percentage Gain YTD')
+    plt.title('META (Facebook) vs TESLA Stock Price Gain YTD')
+    plt.legend()
+    plt.grid()
+    plt.show()
+    ```
+    
+    Please execute the updated code to fetch the stock data and plot the chart.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+
+
+
+    
+![png](output_16_3.png)
+    
+
+
+    [33mipython_user_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    [*********************100%***********************]  1 of 1 completed
+    [*********************100%***********************]  1 of 1 completed
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to ipython_user_proxy):
+    
+    I'm glad the code executed successfully. You should now see a chart comparing the YTD percentage gain of META (Facebook) and TESLA stocks. If you have any further questions or need assistance with another task, feel free to ask.
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+

@@ -1,0 +1,1143 @@
+<a href="https://colab.research.google.com/github/microsoft/autogen/blob/main/notebook/agentchat_compression.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+# Auto Generated Agent Chat: Conversations with Chat History Compression Enabled (Experimental)
+
+AutoGen offers conversable agents powered by LLM, tools, or humans, which can be used to perform tasks collectively via automated chat. This framework allows tool use and human participance through multi-agent conversation. Please find documentation about this feature [here](https://microsoft.github.io/autogen/docs/Use-Cases/agent_chat).
+
+In this notebook, we demonstrate how to enable compression of history messages using the `CompressibleAgent`. While this agent retains all the default functionalities of the `AssistantAgent`, it also provides the added feature of compression when activated through the `compress_config` setting.
+
+Different compression modes are supported:
+1. `compress_config=False` (Default): `CompressibleAgent` is equivalent to `AssistantAgent`.
+2. `compress_config=True` or `compress_config={"mode": "TERMINATE"}`: no compression will be performed. However, we will count token usage before sending requests to the OpenAI model. The conversation will be terminated directly if the total token usage exceeds the maximum token usage allowed by the model (to avoid the token limit error from OpenAI API).
+3. `compress_config={"mode": "COMPRESS", "trigger_count": <your pre-set number>}, "leave_last_n": <your pre-set number>`: compression is enabled.
+    ```python
+    # default compress_config
+    compress_config = {
+        "mode": "COMPRESS",
+        "compress_function": None,
+        "trigger_count": 0.7, # default to 0.7, or your pre-set number
+        "broadcast": True, # the compressed with be broadcast to sender. This will not be used in groupchat.
+
+        # the following settings are for this mode only
+        "leave_last_n": 2, # leave the last n messages in the history to avoid compression
+        "verbose": False, # if True, print out the content to be compressed and the compressed content
+    }
+    ```
+    Currently, our compression logic is as follows:
+        1. We will always leave the first user message (as well as system prompts) and compress the rest of the history messages.
+        2. You can choose to not compress the last n messages in the history with "leave_last_n".
+        2. The summary is performed on a per-message basis, with the role of the messages (See compressed content in the example below).
+
+4. `compress_config={"mode": "CUSTOMIZED", "compress_function": <A customized function for compression>}`: the `compress_function` function will be called on trigger count. The function should accept a list of messages as input and return a tuple of (is_success: bool, compressed_messages: List[Dict]). The whole message history (except system prompt) will be passed.
+
+
+By adjusting `trigger_count`, you can decide when to compress the history messages based on existing tokens. If this is a float number between 0 and 1, it is interpreted as a ratio of max tokens allowed by the model. For example, the AssistantAgent uses gpt-4 with max tokens 8192, the trigger_count = 0.7 * 8192 = 5734.4 -> 5734. Do not set `trigger_count` to the max tokens allowed by the model, since the same LLM is employed for compression and it needs tokens to generate the compressed content. 
+
+
+
+## Limitations
+- For now, the compression feature **is not well-supported for groupchat**. If you initialize a `CompressibleAgent` in a groupchat with compression, the compressed cannot be broadcast to all other agents in the groupchat. If you use this feature in groupchat, extra cost will be incurred since compression will be performed on at per-agent basis.
+- We do not support async compression for now.
+
+## Requirements
+
+AutoGen requires `Python>=3.8`. To run this notebook example, please install:
+```bash
+pip install pyautogen
+```
+
+
+```python
+# %pip install pyautogen~=0.1.0
+```
+
+## Set your API Endpoint
+
+The [`config_list_from_json`](https://microsoft.github.io/autogen/docs/reference/oai/openai_utils#config_list_from_json) function loads a list of configurations from an environment variable or a json file.
+
+
+
+```python
+import autogen
+config_list = autogen.config_list_from_json(
+    "OAI_CONFIG_LIST",
+    filter_dict={
+        "model": ["gpt-4", "gpt-4-0314", "gpt4", "gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-v0314"],
+    },
+)
+```
+
+It first looks for environment variable "OAI_CONFIG_LIST" which needs to be a valid json string. If that variable is not found, it then looks for a json file named "OAI_CONFIG_LIST". It filters the configs by models (you can filter by other keys as well).
+
+The config list looks like the following:
+```python
+config_list = [
+    {
+        'model': 'gpt-4',
+        'api_key': '<your OpenAI API key here>',
+    },
+    {
+        'model': 'gpt-4',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+    {
+        'model': 'gpt-4-32k',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+]
+```
+
+If you open this notebook in colab, you can upload your files by clicking the file icon on the left panel and then choose "upload file" icon.
+
+You can set the value of config_list in other ways you prefer, e.g., loading from a YAML file.
+
+## Example 1
+This example is from [agentchat_MathChat.ipynb](https://github.com/microsoft/autogen/blob/main/notebook/agentchat_MathChat.ipynb). Compression with code execution.
+
+Note: we set `trigger_count=600`, and `leave_last_n=2`. In this example, we set a low trigger_count to demonstrate the compression feature. 
+The token count after compression is still bigger than trigger count, mainly because the trigger count is low an the first and last 2 messages are not compressed. Thus, the compression is performed at each turn. In practice, you want to adjust the trigger_count to a bigger number and properly set the `leave_last_n` to avoid compression at each turn. 
+
+
+```python
+from autogen.agentchat.contrib.math_user_proxy_agent import MathUserProxyAgent
+from autogen.agentchat.contrib.compressible_agent import CompressibleAgent
+
+# 1. replace AssistantAgent with CompressibleAgent
+assistant = CompressibleAgent(
+    name="assistant", 
+    system_message="You are a helpful assistant.",
+    llm_config={
+        "timeout": 600,
+        "cache_seed": 42,
+        "config_list": config_list,
+    },
+    compress_config={
+        "mode": "COMPRESS",
+        "trigger_count": 600, # set this to a large number for less frequent compression
+        "verbose": True, # to allow printing of compression information: contex before and after compression
+        "leave_last_n": 2,
+    }
+)
+
+# 2. create the MathUserProxyAgent instance named "mathproxyagent"
+mathproxyagent = MathUserProxyAgent(
+    name="mathproxyagent", 
+    human_input_mode="NEVER",
+    code_execution_config={"use_docker": False},
+    max_consecutive_auto_reply=5,
+)
+math_problem = "Find all $x$ that satisfy the inequality $(2x+10)(x+3)<(3x+9)(x+8)$. Express your answer in interval notation."
+mathproxyagent.initiate_chat(assistant, problem=math_problem)
+```
+
+    [33mmathproxyagent[0m (to assistant):
+    
+    Let's use Python to solve a math problem.
+    
+    Query requirements:
+    You should always use the 'print' function for the output and use fractions/radical forms instead of decimals.
+    You can use packages like sympy to help you.
+    You must follow the formats below to write your code:
+    ```python
+    # your code
+    ```
+    
+    First state the key idea to solve the problem. You may choose from three ways to solve the problem:
+    Case 1: If the problem can be solved with Python code directly, please write a program to solve it. You can enumerate all possible arrangements if needed.
+    Case 2: If the problem is mostly reasoning, you can solve it by yourself directly.
+    Case 3: If the problem cannot be handled in the above two ways, please follow this process:
+    1. Solve the problem step by step (do not over-divide the steps).
+    2. Take out any queries that can be asked through Python (for example, any calculations or equations that can be calculated).
+    3. Wait for me to give the results.
+    4. Continue if you think the result is correct. If the result is invalid or unexpected, please correct your query or reasoning.
+    
+    After all the queries are run and you get the answer, put the answer in \boxed{}.
+    
+    Problem:
+    Find all $x$ that satisfy the inequality $(2x+10)(x+3)<(3x+9)(x+8)$. Express your answer in interval notation.
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to mathproxyagent):
+    
+    First, we need to consider both sides of the inequality as two separate equations. Then subtract one from the other to set this result equal to zero. This would allow us to find the critical points, i.e., the places where the inequality changes its nature (from less to more or vice versa). Then we find the intervals.
+    
+    Here's how you can solve this problem in Python:
+    
+    ```python
+    from sympy import *
+    from sympy.abc import x
+    
+    # define the equation
+    equation = (2*x+10)*(x+3) - (3*x+9)*(x+8)
+    
+    # set the equation equal to zero to find the critical points
+    critical_points = solve(equation, x)
+    
+    # Sort the critical_points
+    critical_points = sorted(critical_points)
+    
+    # define a function to test the intervals
+    def test_intervals(interval):
+        test_num = sum(interval)/2  # get the mid point of the interval
+        return equation.subs(x, test_num)
+    
+    # define the intervals based on the critical points
+    intervals = [(-oo, critical_points[0]), (critical_points[0], critical_points[1]), (critical_points[1], oo)]
+    
+    solution = []
+    
+    # loop through the intervals, if the result is less than zero, it means it's a valid interval
+    for i in intervals:
+        if test_intervals(i) < 0:
+            solution.append(i)
+    
+    # print the solution in interval notation
+    for interval in solution:
+        print(interval)
+    ```
+    
+    Replace oo with infinity when interpreting the result. Also, keep in mind that in interval notation, parentheses denote that the endpoint is not included in the set, and brackets denote that the end point is included in the set. Thus, (a, b) means "greater than a and less than b", [a, b] means "greater than or equal to a and less than or equal to b".
+    
+    --------------------------------------------------------------------------------
+    [33mmathproxyagent[0m (to assistant):
+    
+    Error: Traceback (most recent call last):
+      File "", line 25, in <module>
+        if test_intervals(i) < 0:
+          return func(self, other)
+          return StrictLessThan(self, other)
+          raise TypeError("Invalid NaN comparison")
+    TypeError: Invalid NaN comparison
+    
+    --------------------------------------------------------------------------------
+
+
+    Warning: Compression skipped at trigger count threshold. The first msg and last 2 msgs will not be compressed. current msg count: 3. Consider raising trigger_count.
+
+
+    [33massistant[0m (to mathproxyagent):
+    
+    I apologize for the oversight. It seems like the function is returning NaN error. Because we are dealing with real numbers, NaN (Not a Number) error could arise from operations that don't return a defined real number. 
+    
+    However, in this case, we it seems there's a problem with the comparison of symbolic terms with zero in the function test_intervals.
+    
+    Let's correct this approach. The error arises from trying to compare a symbolic expression to zero directly. Instead, we can create a numeric function from our symbolic expression, and use this function to test the intervals. 
+    
+    Here is the revised code:
+    
+    ```python
+    from sympy import *
+    from sympy.abc import x
+    
+    # define the equation
+    equation = expand((2*x+10)*(x+3) - (3*x+9)*(x+8))
+    
+    # set the equation equal to zero to find the critical points
+    critical_points = solve(equation, x)
+    
+    # Convert the points to standard python floats, so that they can be sorted numerically
+    critical_points = [N(i) for i in critical_points]
+    
+    # Sort the critical_points
+    critical_points = sorted(critical_points)
+    
+    # define a function to test the intervals
+    def test_intervals(interval):
+      test_num = N(sum(interval)/2)  # get the mid point of the interval
+      return equation.subs(x, test_num)
+    
+    # define the intervals based on the critical points
+    intervals = [(-oo, critical_points[0]), (critical_points[0], critical_points[1]), (critical_points[1], oo)]
+    
+    # Now, let's create a numeric function from this symbolic equation
+    numeric_equation = lambdify(x, equation)
+    
+    solution = []
+    
+    # loop through the intervals, first find the mid point of each interval, 
+    # then if numeric result for this mid point is less than zero, it means it's a valid interval
+    for interval in intervals:
+        mid_point = sum(interval) / 2  
+        if numeric_equation(mid_point) < 0:
+            solution.append(interval)
+    
+    # print the solution in interval notation
+    for interval in solution:
+        print(interval)
+    ```
+    
+    Remember to replace `oo` with infinity while interpreting the output.
+    
+    --------------------------------------------------------------------------------
+    [33mmathproxyagent[0m (to assistant):
+    
+    Error: Traceback (most recent call last):
+      File "", line 36, in <module>
+        if numeric_equation(mid_point) < 0:
+          return func(self, other)
+          return StrictLessThan(self, other)
+          raise TypeError("Invalid NaN comparison")
+    TypeError: Invalid NaN comparison
+    
+    --------------------------------------------------------------------------------
+    [35m******************************Start compressing the following content:******************************[0m
+    To be compressed:
+    ##ASSISTANT## First, we need to consider both sides of the inequality as two separate equations. Then subtract one from the other to set this result equal to zero. This would allow us to find the critical points, i.e., the places where the inequality changes its nature (from less to more or vice versa). Then we find the intervals.
+    
+    Here's how you can solve this problem in Python:
+    
+    ```python
+    from sympy import *
+    from sympy.abc import x
+    
+    # define the equation
+    equation = (2*x+10)*(x+3) - (3*x+9)*(x+8)
+    
+    # set the equation equal to zero to find the critical points
+    critical_points = solve(equation, x)
+    
+    # Sort the critical_points
+    critical_points = sorted(critical_points)
+    
+    # define a function to test the intervals
+    def test_intervals(interval):
+        test_num = sum(interval)/2  # get the mid point of the interval
+        return equation.subs(x, test_num)
+    
+    # define the intervals based on the critical points
+    intervals = [(-oo, critical_points[0]), (critical_points[0], critical_points[1]), (critical_points[1], oo)]
+    
+    solution = []
+    
+    # loop through the intervals, if the result is less than zero, it means it's a valid interval
+    for i in intervals:
+        if test_intervals(i) < 0:
+            solution.append(i)
+    
+    # print the solution in interval notation
+    for interval in solution:
+        print(interval)
+    ```
+    
+    Replace oo with infinity when interpreting the result. Also, keep in mind that in interval notation, parentheses denote that the endpoint is not included in the set, and brackets denote that the end point is included in the set. Thus, (a, b) means "greater than a and less than b", [a, b] means "greater than or equal to a and less than or equal to b".
+    ##USER## Error: Traceback (most recent call last):
+      File "", line 25, in <module>
+        if test_intervals(i) < 0:
+          return func(self, other)
+          return StrictLessThan(self, other)
+          raise TypeError("Invalid NaN comparison")
+    TypeError: Invalid NaN comparison
+    
+    [35m******************************Content after compressing:******************************[0m
+    ##ASSISTANT##
+    The assistant provides instructions to solve an inequality, which involves considering separate equations for the inequality components, finding the differing point (set to zero), identifying critical points (where nature of inequality changes), and determining the intervals. 
+    
+    They also share Python code for the process, using sympy library. Steps include defining the equation, finding critical points by setting equation to zero, sorting these points, defining a function to test the intervals, determining intervals based on critical points, and looping through intervals to identify valid solutions. The assistant defines 'oo' as infinity and clarifies the use of parentheses and brackets to denote exclusion or inclusion of endpoints in interval notation.
+    
+    ##CODE##
+    Python script to solve the given inequality and display the solution using interval notation.
+    
+    ##USER##
+    User encounters 'TypeError: Invalid NaN comparison', indicating there's an error when comparing a test interval to zero in the Python script shared by the assistant.
+     [35m
+    ********************************************************************************[0m
+    [35mToken Count (including 13 tokens from system msg and function descriptions). Before compression : 1294 | After: 1045[0m
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to mathproxyagent):
+    
+    I apologize for the confusion. There's an error with the calculation of mid_point when the interval is from negative infinity to a real number or a real number to infinity. In these circumstances, the calculation will return a NaN which cannot be used in comparison. We could handle these issues specifically.
+    
+    Let's refine the script:
+    
+    ```python
+    from sympy import *
+    from sympy.abc import x
+    
+    # define the equation
+    equation = expand((2*x+10)*(x+3) - (3*x+9)*(x+8))
+    
+    # set the equation equal to zero to find the critical points
+    critical_points = solve(equation, x)
+    
+    # Convert the points to standard python floats, so that they can be sorted numerically
+    critical_points = [N(i) for i in critical_points]
+    
+    # Sort the critical_points
+    critical_points = sorted(critical_points)
+    
+    # Now, let's create a numeric function from this symbolic equation
+    numeric_equation = lambdify(x, equation)
+    
+    solution = []
+    
+    # Define the intervals based on the critical points
+    intervals = [(-oo, critical_points[0]), (critical_points[0], critical_points[1]), (critical_points[1], oo)]
+    
+    # Loop through the intervals and compute the mid point of each interval
+    # If the mid point is NaN (occurs when dealing with infinity), then specific values are used for testing
+    for interval in intervals:
+        if interval[0] == -oo:
+            test_value = interval[1] - 1
+        elif interval[1] == oo:
+            test_value = interval[0] + 1
+        else:
+            test_value = sum(interval) / 2
+    
+        # If numeric result for test_value is less than zero, it's a valid interval
+        if numeric_equation(test_value) < 0:
+            solution.append(interval)
+    
+    # Print out the solution intervals
+    for interval in solution:
+        print(interval)
+    ```
+    
+    The script now handles the special cases when dealing with infinity and should return the valid intervals.
+    
+    --------------------------------------------------------------------------------
+    [33mmathproxyagent[0m (to assistant):
+    
+    (-oo, -14.0000000000000)
+    (-3.00000000000000, oo)
+    
+    --------------------------------------------------------------------------------
+    [35m******************************Start compressing the following content:******************************[0m
+    To be compressed:
+    ##ASSISTANT##
+    The assistant provides instructions to solve an inequality, which involves considering separate equations for the inequality components, finding the differing point (set to zero), identifying critical points (where nature of inequality changes), and determining the intervals. 
+    
+    They also share Python code for the process, using sympy library. Steps include defining the equation, finding critical points by setting equation to zero, sorting these points, defining a function to test the intervals, determining intervals based on critical points, and looping through intervals to identify valid solutions. The assistant defines 'oo' as infinity and clarifies the use of parentheses and brackets to denote exclusion or inclusion of endpoints in interval notation.
+    
+    ##CODE##
+    Python script to solve the given inequality and display the solution using interval notation.
+    
+    ##USER##
+    User encounters 'TypeError: Invalid NaN comparison', indicating there's an error when comparing a test interval to zero in the Python script shared by the assistant.
+    
+    ##ASSISTANT## I apologize for the oversight. It seems like the function is returning NaN error. Because we are dealing with real numbers, NaN (Not a Number) error could arise from operations that don't return a defined real number. 
+    
+    However, in this case, we it seems there's a problem with the comparison of symbolic terms with zero in the function test_intervals.
+    
+    Let's correct this approach. The error arises from trying to compare a symbolic expression to zero directly. Instead, we can create a numeric function from our symbolic expression, and use this function to test the intervals. 
+    
+    Here is the revised code:
+    
+    ```python
+    from sympy import *
+    from sympy.abc import x
+    
+    # define the equation
+    equation = expand((2*x+10)*(x+3) - (3*x+9)*(x+8))
+    
+    # set the equation equal to zero to find the critical points
+    critical_points = solve(equation, x)
+    
+    # Convert the points to standard python floats, so that they can be sorted numerically
+    critical_points = [N(i) for i in critical_points]
+    
+    # Sort the critical_points
+    critical_points = sorted(critical_points)
+    
+    # define a function to test the intervals
+    def test_intervals(interval):
+      test_num = N(sum(interval)/2)  # get the mid point of the interval
+      return equation.subs(x, test_num)
+    
+    # define the intervals based on the critical points
+    intervals = [(-oo, critical_points[0]), (critical_points[0], critical_points[1]), (critical_points[1], oo)]
+    
+    # Now, let's create a numeric function from this symbolic equation
+    numeric_equation = lambdify(x, equation)
+    
+    solution = []
+    
+    # loop through the intervals, first find the mid point of each interval, 
+    # then if numeric result for this mid point is less than zero, it means it's a valid interval
+    for interval in intervals:
+        mid_point = sum(interval) / 2  
+        if numeric_equation(mid_point) < 0:
+            solution.append(interval)
+    
+    # print the solution in interval notation
+    for interval in solution:
+        print(interval)
+    ```
+    
+    Remember to replace `oo` with infinity while interpreting the output.
+    ##USER## Error: Traceback (most recent call last):
+      File "", line 36, in <module>
+        if numeric_equation(mid_point) < 0:
+          return func(self, other)
+          return StrictLessThan(self, other)
+          raise TypeError("Invalid NaN comparison")
+    TypeError: Invalid NaN comparison
+    
+    [35m******************************Content after compressing:******************************[0m
+    ##ASSISTANT##
+    The assistant provides steps to solve an inequality, including considering separate equations, finding the differing point (set to zero), identifying critical points, and determining intervals. They provide Python code using sympy for the process, defining 'oo' as infinity and explaining usage of parentheses and brackets in interval notation. 
+    
+    ##CODE##
+    The assistant provides Python code for solving an inequality and displaying the solution in interval notation.
+    
+    ##USER##
+    The user reports encountering a 'TypeError: Invalid NaN comparison' when comparing a test interval to zero in the script provided by the assistant.
+    
+    ##ASSISTANT##
+    The assistant apologizes for the oversight and suggests the issue might lie in the comparison of symbolic terms with zero. The assistant then provides revised code, explaining it creates a numeric function from the symbolic expression to test the intervals. It's highlighted to replace 'oo' with infinity when interpreting the output.
+    
+    ##CODE##
+    Revised Python code is given by the assistant to solve a TypeError that occurred in the initial code.
+    
+    ##USER##
+    The user reports another TypeError ('Invalid NaN comparison') when executing the revised code provided by the assistant. [35m
+    ********************************************************************************[0m
+    [35mToken Count (including 13 tokens from system msg and function descriptions). Before compression : 1494 | After: 1013[0m
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to mathproxyagent):
+    
+    Great! You have got the correct answer.
+    
+    So, for $x$ in the interval $(-\infty, -14]$ and $(-3, +\infty)$, the inequality $(2x+10)(x+3)<(3x+9)(x+8)$ is satisfied. 
+    
+    In interval notation, this result can be written as $(-\infty, -14] \cup (-3, +\infty)$.
+    
+    The final answer is:
+    
+    \boxed{(-\infty, -14] \cup (-3, +\infty)}
+    
+    --------------------------------------------------------------------------------
+
+
+## Example 2
+This example is from [agentchat_function_call.ipynb](https://github.com/microsoft/autogen/blob/main/notebook/agentchat_function_call.ipynb). Compression with function calls. 
+
+
+```python
+llm_config = {
+    "functions": [
+        {
+            "name": "python",
+            "description": "run cell in ipython and return the execution result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cell": {
+                        "type": "string",
+                        "description": "Valid Python cell to execute.",
+                    }
+                },
+                "required": ["cell"],
+            },
+        },
+        {
+            "name": "sh",
+            "description": "run a shell script and return the execution result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Valid shell script to execute.",
+                    }
+                },
+                "required": ["script"],
+            },
+        },
+    ],
+    "config_list": config_list,
+    "timeout": 120,
+}
+import autogen
+from autogen.agentchat.contrib.compressible_agent import CompressibleAgent
+
+chatbot = CompressibleAgent(
+    name="chatbot",
+    system_message="For coding tasks, only use the functions you have been provided with. Reply TERMINATE when the task is done.",
+    llm_config=llm_config,
+    compress_config={
+        "mode": "COMPRESS",
+        "trigger_count": 600, # set this to a large number for less frequent compression
+        "verbose": True, # set this to False to suppress the compression log
+        "leave_last_n": 2,
+    }
+)
+
+# create a UserProxyAgent instance named "user_proxy"
+user_proxy = autogen.UserProxyAgent(
+    name="user_proxy",
+    is_termination_msg=lambda x: x.get("content", "") and x.get("content", "").rstrip().endswith("TERMINATE"),
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=10,
+    code_execution_config={"work_dir": "coding"},
+)
+
+# define functions according to the function desription
+from IPython import get_ipython
+
+def exec_python(cell):
+    ipython = get_ipython()
+    result = ipython.run_cell(cell)
+    log = str(result.result)
+    if result.error_before_exec is not None:
+        log += f"\n{result.error_before_exec}"
+    if result.error_in_exec is not None:
+        log += f"\n{result.error_in_exec}"
+    return log
+
+def exec_sh(script):
+    return user_proxy.execute_code_blocks([("sh", script)])
+
+# register the functions
+user_proxy.register_function(
+    function_map={
+        "python": exec_python,
+        "sh": exec_sh,
+    }
+)
+
+# start the conversation
+user_proxy.initiate_chat(
+    chatbot,
+    message="Draw two agents chatting with each other with an example dialog. Don't add plt.show().",
+)
+
+```
+
+    [33muser_proxy[0m (to chatbot):
+    
+    Draw two agents chatting with each other with an example dialog. Don't add plt.show().
+    
+    --------------------------------------------------------------------------------
+    [33mchatbot[0m (to user_proxy):
+    
+    [32m***** Suggested function Call: python *****[0m
+    Arguments: 
+    {
+      "cell": 
+      "import matplotlib.pyplot as plt
+    
+      # Define agent texts
+      agent1_texts = ['Hello there!', 'Nice to meet you.', 'How can I assist you?']
+      agent2_texts = ['Hey!', 'Nice meeting you too.', 'Could you help me solve a problem?']
+    
+      # Define agent y positions
+      agent1_y = [3, 2, 1]
+      agent2_y = [3, 2, 1]
+    
+      # Create figure and axis
+      fig, ax = plt.subplots()
+    
+      # Plot Agent 1 texts
+      for i, text in enumerate(agent1_texts):
+          ax.text(0, agent1_y[i], text, fontsize=12, ha='right')
+    
+      # Plot Agent 2 texts
+      for i, text in enumerate(agent2_texts):
+          ax.text(1, agent2_y[i], text, fontsize=12, ha='left')
+    
+      # Set plot attributes
+      ax.set_xlim(-0.5, 1.5)
+      ax.set_ylim(0, 4)
+      ax.set_xticks([0, 1])
+      ax.set_xticklabels(['Agent 1', 'Agent 2'])
+      ax.set_yticks([])
+      ax.spines['top'].set_visible(False)
+      ax.spines['right'].set_visible(False)
+      ax.spines['bottom'].set_visible(False)"
+    }
+    [32m*******************************************[0m
+    
+    --------------------------------------------------------------------------------
+    [35m
+    >>>>>>>> EXECUTING FUNCTION python...[0m
+
+
+
+      Cell In[3], line 4
+        agent1_texts = ['Hello there!', 'Nice to meet you.', 'How can I assist you?']
+        ^
+    IndentationError: unexpected indent
+
+
+
+    [33muser_proxy[0m (to chatbot):
+    
+    [32m***** Response from calling function "python" *****[0m
+    None
+    unexpected indent (1440792568.py, line 4)
+    [32m***************************************************[0m
+    
+    --------------------------------------------------------------------------------
+    [33mchatbot[0m (to user_proxy):
+    
+    [32m***** Suggested function Call: python *****[0m
+    Arguments: 
+    {
+      "cell": 
+      "import matplotlib.pyplot as plt
+    
+    # Define agent texts
+    agent1_texts = ['Hello there!', 'Nice to meet you.', 'How can I assist you?']
+    agent2_texts = ['Hey!', 'Nice meeting you too.', 'Could you help me solve a problem?']
+    
+    # Define agent y positions
+    agent1_y = [3, 2, 1]
+    agent2_y = [3, 2, 1]
+    
+    # Create figure and axis
+    fig, ax = plt.subplots()
+    
+    # Plot Agent 1 texts
+    for i, text in enumerate(agent1_texts):
+        ax.text(0, agent1_y[i], text, fontsize=12, ha='right')
+    
+    # Plot Agent 2 texts
+    for i, text in enumerate(agent2_texts):
+        ax.text(1, agent2_y[i], text, fontsize=12, ha='left')
+    
+    # Set plot attributes
+    ax.set_xlim(-0.5, 1.5)
+    ax.set_ylim(0, 4)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(['Agent 1', 'Agent 2'])
+    ax.set_yticks([])
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)"
+    }
+    [32m*******************************************[0m
+    
+    --------------------------------------------------------------------------------
+    [35m
+    >>>>>>>> EXECUTING FUNCTION python...[0m
+
+
+
+    
+![png](output_9_3.png)
+    
+
+
+    [33muser_proxy[0m (to chatbot):
+    
+    [32m***** Response from calling function "python" *****[0m
+    None
+    [32m***************************************************[0m
+    
+    --------------------------------------------------------------------------------
+    [35m******************************Start compressing the following content:******************************[0m
+    To be compressed:
+    ##FUNCTION_CALL## 
+    Name: python
+    Args: {
+      "cell": 
+      "import matplotlib.pyplot as plt
+    
+      # Define agent texts
+      agent1_texts = ['Hello there!', 'Nice to meet you.', 'How can I assist you?']
+      agent2_texts = ['Hey!', 'Nice meeting you too.', 'Could you help me solve a problem?']
+    
+      # Define agent y positions
+      agent1_y = [3, 2, 1]
+      agent2_y = [3, 2, 1]
+    
+      # Create figure and axis
+      fig, ax = plt.subplots()
+    
+      # Plot Agent 1 texts
+      for i, text in enumerate(agent1_texts):
+          ax.text(0, agent1_y[i], text, fontsize=12, ha='right')
+    
+      # Plot Agent 2 texts
+      for i, text in enumerate(agent2_texts):
+          ax.text(1, agent2_y[i], text, fontsize=12, ha='left')
+    
+      # Set plot attributes
+      ax.set_xlim(-0.5, 1.5)
+      ax.set_ylim(0, 4)
+      ax.set_xticks([0, 1])
+      ax.set_xticklabels(['Agent 1', 'Agent 2'])
+      ax.set_yticks([])
+      ax.spines['top'].set_visible(False)
+      ax.spines['right'].set_visible(False)
+      ax.spines['bottom'].set_visible(False)"
+    }
+    ##FUNCTION_RETURN## (from function "python"): 
+    None
+    unexpected indent (1440792568.py, line 4)
+    
+    [35m******************************Content after compressing:******************************[0m
+    ##FUNCTION_CALL##
+    Name: python
+    Args: Executing a block of Python code that imports the matplotlib.pyplot library for graphing and plotting. It defines texts for two agents and sets y positions. It also creates a figure and plots the agent texts on a graph with specific attributes.
+     
+    ##FUNCTION_RETURN## (from function "python"):
+    None. Execution failed due to an unexpected indentation error at line 4.
+     [35m
+    ********************************************************************************[0m
+    [35mToken Count (including 107 tokens from system msg and function descriptions). Before compression : 821 | After: 564[0m
+    --------------------------------------------------------------------------------
+    [33mchatbot[0m (to user_proxy):
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
+
+## Example 3
+This example is from [agent_chat_web_info.ipynb](https://github.com/microsoft/autogen/blob/main/notebook/agentchat_web_info.ipynb). 
+We use this example to demonstrate how to pass in a customized compression function. We pass in an compression function `constrain_num_messages`, which constrains the number of messages to be 3 or less. 
+The customized function should accept a list of messages as input and return a tuple of `(is_success: bool, compressed_messages: List[Dict])`.
+
+
+```python
+import autogen
+from autogen.agentchat.contrib.math_user_proxy_agent import MathUserProxyAgent
+from autogen.agentchat.contrib.compressible_agent import CompressibleAgent
+
+def constrain_num_messages(messages):
+    """Constrain the number of messages to 3.
+    
+    This is an example of a customized compression function.
+
+    Returns:
+        bool: whether the compression is successful.
+        list: the compressed messages.
+    """
+    if len(messages) <= 3:
+        # do nothing
+        return False, None
+    
+    # save the first and last two messages
+    return True, messages[:1] + messages[-2:]
+
+# create a CompressibleAgent instance named "assistant"
+assistant = CompressibleAgent(
+    name="assistant",
+    llm_config={
+        "timeout": 600,
+        "cache_seed": 43,
+        "config_list": config_list,
+    },
+    compress_config={
+        "mode": "CUSTOMIZED",
+        "compress_function": constrain_num_messages,  # this is required for customized compression
+        "trigger_count": 1600, 
+    },
+)
+
+# create a UserProxyAgent instance named "user_proxy"
+user_proxy = autogen.UserProxyAgent(
+    name="user_proxy",
+    human_input_mode="TERMINATE",
+    max_consecutive_auto_reply=10,
+    is_termination_msg=lambda x: x.get("content", "").rstrip().endswith("TERMINATE") or x.get("content", "").rstrip().endswith("TERMINATE."),
+    code_execution_config={"work_dir": "web"},
+    system_message="""Reply TERMINATE if the task has been solved at full satisfaction.
+Otherwise, reply CONTINUE, or the reason why the task is not solved yet."""
+)
+
+user_proxy.initiate_chat(
+    assistant,
+    message="""Show me the YTD gain of 10 largest technology companies as of today.""",
+)
+
+```
+
+    [33muser_proxy[0m (to assistant):
+    
+    Show me the YTD gain of 10 largest technology companies as of today.
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    To fulfill your request, we first need a list of the 10 largest technology companies by market cap. Unfortunately, real-time financial data is gated behind paywalls, so it's difficult to get up-to-date reliable information through coding here. 
+    
+    However, I can provide you a script to download YTD performance for a given list of companies if you already know the list. Below is an example using Yahoo Finance, for which Python has a usable API.
+    
+    Frequently mentioned largest technology companies include: Apple (AAPL), Microsoft (MSFT), Alphabet (GOOGL), Amazon (AMZN), Meta (FB), Tesla (TSLA), Alibaba group holding (BABA), Taiwan Semiconductor (TSM), Tencent (TCEHY), Oracle (ORCL). Adjust as necessary for your purpose.
+    
+    First, we need to install yfinance module:
+    
+    ```sh
+    pip install yfinance
+    ```
+    
+    Then, you can use this Python script to get the YTD performance. 
+    
+    This Python script first gets the price at the beginning of the year, and then the most recent price. The difference between those two prices, divided by the starting price, gives the YTD performance.
+    
+    ```python
+    # filename: ytd_gain.py
+    
+    import yfinance as yf
+    from datetime import datetime
+    
+    # Define the tickers
+    tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'FB', 'TSLA', 'BABA', 'TSM', 'TCEHY', 'ORCL']
+    now = datetime.now()
+    
+    # Define the current year
+    current_year = now.year
+    
+    # Iterate through each ticker
+    for ticker in tickers:
+        # Download the year-to-date data for this ticker
+        ticker_data = yf.download(ticker, start=f'{current_year}-01-01', end=f'{now.year}-{now.month}-{now.day}')
+    
+        # Get the close price at the beginning of the year
+        initial_price = ticker_data['Close'][0]
+    
+        # Get the most recent close price
+        most_recent_price = ticker_data['Close'][-1]
+    
+        # Calculate the year-to-date return
+        ytd_return = (most_recent_price - initial_price) / initial_price * 100
+    
+        # Print the result
+        print(f'The YTD return for {ticker} is {ytd_return:.2f}%')
+    ```
+    
+    Run the file in shell:
+    
+    ```sh
+    python ytd_gain.py
+    ```
+    
+    The output will be the YTD gain (%) of each company to the console. Please note that actual results will depend on the input list of tickers and the current date.
+    
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> USING AUTO REPLY...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is sh)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 1 (inferred language is python)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 1 (execution failed)
+    Code output: 
+    Requirement already satisfied: yfinance in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (0.2.31)
+    Requirement already satisfied: pandas>=1.3.0 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (2.1.2)
+    Requirement already satisfied: numpy>=1.16.5 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (1.26.1)
+    Requirement already satisfied: requests>=2.31 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (2.31.0)
+    Requirement already satisfied: multitasking>=0.0.7 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (0.0.11)
+    Requirement already satisfied: lxml>=4.9.1 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (4.9.3)
+    Requirement already satisfied: appdirs>=1.4.4 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (1.4.4)
+    Requirement already satisfied: pytz>=2022.5 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (2023.3.post1)
+    Requirement already satisfied: frozendict>=2.3.4 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (2.3.8)
+    Requirement already satisfied: peewee>=3.16.2 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (3.17.0)
+    Requirement already satisfied: beautifulsoup4>=4.11.1 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (4.12.2)
+    Requirement already satisfied: html5lib>=1.1 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from yfinance) (1.1)
+    Requirement already satisfied: soupsieve>1.2 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from beautifulsoup4>=4.11.1->yfinance) (2.5)
+    Requirement already satisfied: six>=1.9 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (1.16.0)
+    Requirement already satisfied: webencodings in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from html5lib>=1.1->yfinance) (0.5.1)
+    Requirement already satisfied: python-dateutil>=2.8.2 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from pandas>=1.3.0->yfinance) (2.8.2)
+    Requirement already satisfied: tzdata>=2022.1 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from pandas>=1.3.0->yfinance) (2023.3)
+    Requirement already satisfied: charset-normalizer<4,>=2 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.3.1)
+    Requirement already satisfied: idna<4,>=2.5 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from requests>=2.31->yfinance) (3.4)
+    Requirement already satisfied: urllib3<3,>=1.21.1 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2.0.7)
+    Requirement already satisfied: certifi>=2017.4.17 in /home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages (from requests>=2.31->yfinance) (2023.7.22)
+    
+    ytd_gain.py:19: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      initial_price = ticker_data['Close'][0]
+    ytd_gain.py:22: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      most_recent_price = ticker_data['Close'][-1]
+    ytd_gain.py:19: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      initial_price = ticker_data['Close'][0]
+    ytd_gain.py:22: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      most_recent_price = ticker_data['Close'][-1]
+    ytd_gain.py:19: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      initial_price = ticker_data['Close'][0]
+    ytd_gain.py:22: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      most_recent_price = ticker_data['Close'][-1]
+    ytd_gain.py:19: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      initial_price = ticker_data['Close'][0]
+    ytd_gain.py:22: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+      most_recent_price = ticker_data['Close'][-1]
+    
+    1 Failed download:
+    ['FB']: Exception('%ticker%: No timezone found, symbol may be delisted')
+    Traceback (most recent call last):
+      File "ytd_gain.py", line 19, in <module>
+        initial_price = ticker_data['Close'][0]
+      File "/home/ykw5399/.conda/envs/dev2/lib/python3.9/site-packages/pandas/core/series.py", line 1037, in __getitem__
+        return self._values[key]
+    IndexError: index 0 is out of bounds for axis 0 with size 0
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    There seems to be an issue with the ticker symbol 'FB'. The error message shows 'FB': No timezone found, symbol may be delisted. This is because 'FB' has been recently changed to 'META' so the symbol 'FB' is causing the issue.
+    
+    We can replace 'FB' with 'META' and rerun the Python script. The error messages for series indexing are warnings rather than errors. It seems recent changes in pandas library caused these warnings. To resolve this, `iloc` function will be utilized to get the first and last items of the Series.
+    
+    Here is the updated Python script:
+    
+    ```python
+    # filename: ytd_gain.py
+    
+    import yfinance as yf
+    from datetime import datetime
+    
+    # Define the tickers
+    tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'BABA', 'TSM', 'TCEHY', 'ORCL']
+    now = datetime.now()
+    
+    # Define the current year
+    current_year = now.year
+    
+    # Iterate through each ticker
+    for ticker in tickers:
+        # Download the year-to-date data for this ticker
+        ticker_data = yf.download(ticker, start=f'{current_year}-01-01', end=f'{now.year}-{now.month}-{now.day}')
+    
+        # Get the close price at the beginning of the year
+        initial_price = ticker_data['Close'].iloc[0]
+    
+        # Get the most recent close price
+        most_recent_price = ticker_data['Close'].iloc[-1]
+    
+        # Calculate the year-to-date return
+        ytd_return = (most_recent_price - initial_price) / initial_price * 100
+    
+        # Print the result
+        print(f'The YTD return for {ticker} is {ytd_return:.2f}%')
+    ```
+    
+    Run the file in shell:
+    
+    ```sh
+    python ytd_gain.py
+    ```
+    
+    This script will print the YTD gain (%) of each company to the console.
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> USING AUTO REPLY...[0m
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 1 (inferred language is sh)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for AAPL is 41.24%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for MSFT is 47.26%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for GOOGL is 44.86%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for AMZN is 61.50%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for META is 152.20%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TSLA is 103.48%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for BABA is -7.25%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TSM is 23.99%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TCEHY is -12.16%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for ORCL is 29.06%
+    
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for AAPL is 41.24%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for MSFT is 47.26%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for GOOGL is 44.86%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for AMZN is 61.50%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for META is 152.20%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TSLA is 103.48%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for BABA is -7.25%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TSM is 23.99%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for TCEHY is -12.16%
+    
+    [*********************100%%**********************]  1 of 1 completed
+    The YTD return for ORCL is 29.06%
+    
+    
+    --------------------------------------------------------------------------------
+    [35mToken Count (including 468 tokens from system msg and function descriptions). Before compression : 3684 | After: 1509[0m
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    It appears that you've run the script twice, as the results are duplicated. From the code output, here are the Year-to-Date (YTD) returns for the 10 largest technology companies:
+    
+    1. AAPL (Apple): 41.24% gain
+    2. MSFT (Microsoft): 47.26% gain
+    3. GOOGL (Alphabet Class A): 44.86% gain
+    4. AMZN (Amazon): 61.50% gain
+    5. META (Meta Platforms, previously Facebook): 152.20% gain
+    6. TSLA (Tesla): 103.48% gain
+    7. BABA (Alibaba): -7.25% loss
+    8. TSM (Taiwan Semiconductor Manufacturing): 23.99% gain
+    9. TCEHY (Tencent Holdings): -12.16% loss
+    10. ORCL (Oracle): 29.06% gain
+    
+    Please note, the percentage change could have slight differences due to market volatility and the exact times the prices were taken. 
+    
+    If everything looks good, let's wrap up. If you need any more help with other tasks, just let me know! 
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+

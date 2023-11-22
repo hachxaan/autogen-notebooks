@@ -1,0 +1,1131 @@
+<a href="https://colab.research.google.com/github/microsoft/autogen/blob/main/notebook/agentchat_qdrant_RetrieveChat.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+<a id="toc"></a>
+# Using RetrieveChat with Qdrant for Retrieve Augmented Code Generation and Question Answering
+
+[Qdrant](https://qdrant.tech/) is a high-performance vector search engine/database.
+
+This notebook demonstrates the usage of `QdrantRetrieveUserProxyAgent` for RAG, based on [agentchat_RetrieveChat.ipynb](https://colab.research.google.com/github/microsoft/autogen/blob/main/notebook/agentchat_RetrieveChat.ipynb).
+
+
+RetrieveChat is a conversational system for retrieve augmented code generation and question answering. In this notebook, we demonstrate how to utilize RetrieveChat to generate code and answer questions based on customized documentations that are not present in the LLM's training dataset. RetrieveChat uses the `RetrieveAssistantAgent` and `QdrantRetrieveUserProxyAgent`, which is similar to the usage of `AssistantAgent` and `UserProxyAgent` in other notebooks (e.g., [Automated Task Solving with Code Generation, Execution & Debugging](https://github.com/microsoft/autogen/blob/main/notebook/agentchat_auto_feedback_from_code_execution.ipynb)).
+
+We'll demonstrate usage of RetrieveChat with Qdrant for code generation and question answering w/ human feedback.
+
+
+## Requirements
+
+AutoGen requires `Python>=3.8`. To run this notebook example, please install the [retrievechat] option.
+```bash
+pip install "pyautogen[retrievechat]~=0.2.0b5" "flaml[automl]" "qdrant_client[fastembed]"
+```
+
+
+```python
+# %pip install "pyautogen[retrievechat]~=0.2.0b5" "flaml[automl]" "qdrant_client[fastembed]"
+```
+
+## Set your API Endpoint
+
+The [`config_list_from_json`](https://microsoft.github.io/autogen/docs/reference/oai/openai_utils#config_list_from_json) function loads a list of configurations from an environment variable or a json file.
+
+
+
+```python
+import autogen
+
+config_list = autogen.config_list_from_json(
+    env_or_file="OAI_CONFIG_LIST",
+    file_location=".",
+    filter_dict={
+        "model": {
+            "gpt-4",
+            "gpt4",
+            "gpt-4-32k",
+            "gpt-4-32k-0314",
+            "gpt-35-turbo",
+            "gpt-3.5-turbo",
+        }
+    },
+)
+
+assert len(config_list) > 0
+print("models to use: ", [config_list[i]["model"] for i in range(len(config_list))])
+```
+
+    models to use:  ['gpt-3.5-turbo']
+
+
+It first looks for environment variable "OAI_CONFIG_LIST" which needs to be a valid json string. If that variable is not found, it then looks for a json file named "OAI_CONFIG_LIST". It filters the configs by models (you can filter by other keys as well). Only the gpt-4 and gpt-3.5-turbo models are kept in the list based on the filter condition.
+
+The config list looks like the following:
+```python
+config_list = [
+    {
+        'model': 'gpt-4',
+        'api_key': '<your OpenAI API key here>',
+    },
+    {
+        'model': 'gpt-4',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+    {
+        'model': 'gpt-3.5-turbo',
+        'api_key': '<your Azure OpenAI API key here>',
+        'base_url': '<your Azure OpenAI API base here>',
+        'api_type': 'azure',
+        'api_version': '2023-06-01-preview',
+    },
+]
+```
+
+If you open this notebook in colab, you can upload your files by clicking the file icon on the left panel and then choose "upload file" icon.
+
+You can set the value of config_list in other ways you prefer, e.g., loading from a YAML file.
+
+
+```python
+# Accepted file formats for that can be stored in 
+# a vector database instance
+from autogen.retrieve_utils import TEXT_FORMATS
+
+print("Accepted file formats for `docs_path`:")
+print(TEXT_FORMATS)
+```
+
+    Accepted file formats for `docs_path`:
+    ['txt', 'json', 'csv', 'tsv', 'md', 'html', 'htm', 'rtf', 'rst', 'jsonl', 'log', 'xml', 'yaml', 'yml', 'pdf']
+
+
+## Construct agents for RetrieveChat
+
+We start by initialzing the `RetrieveAssistantAgent` and `QdrantRetrieveUserProxyAgent`. The system message needs to be set to "You are a helpful assistant." for RetrieveAssistantAgent. The detailed instructions are given in the user message. Later we will use the `QdrantRetrieveUserProxyAgent.generate_init_prompt` to combine the instructions and a retrieval augmented generation task for an initial prompt to be sent to the LLM assistant.
+
+### You can find the list of all the embedding models supported by Qdrant [here](https://qdrant.github.io/fastembed/examples/Supported_Models/).
+
+
+```python
+from autogen.agentchat.contrib.retrieve_assistant_agent import RetrieveAssistantAgent
+from autogen.agentchat.contrib.qdrant_retrieve_user_proxy_agent import QdrantRetrieveUserProxyAgent
+from qdrant_client import QdrantClient
+
+# 1. create an RetrieveAssistantAgent instance named "assistant"
+assistant = RetrieveAssistantAgent(
+    name="assistant", 
+    system_message="You are a helpful assistant.",
+    llm_config={
+        "timeout": 600,
+        "cache_seed": 42,
+        "config_list": config_list,
+    },
+)
+
+# 2. create the QdrantRetrieveUserProxyAgent instance named "ragproxyagent"
+# By default, the human_input_mode is "ALWAYS", which means the agent will ask for human input at every step. We set it to "NEVER" here.
+# `docs_path` is the path to the docs directory. It can also be the path to a single file, or the url to a single file. By default, 
+# it is set to None, which works only if the collection is already created.
+# 
+# Here we generated the documentations from FLAML's docstrings. Not needed if you just want to try this notebook but not to reproduce the
+# outputs. Clone the FLAML (https://github.com/microsoft/FLAML) repo and navigate to its website folder. Pip install and run `pydoc-markdown`
+# and it will generate folder `reference` under `website/docs`.
+#
+# `task` indicates the kind of task we're working on. In this example, it's a `code` task.
+# `chunk_token_size` is the chunk token size for the retrieve chat. By default, it is set to `max_tokens * 0.6`, here we set it to 2000.
+# We use an in-memory QdrantClient instance here. Not recommended for production.
+# Get the installation instructions here: https://qdrant.tech/documentation/guides/installation/
+ragproxyagent = QdrantRetrieveUserProxyAgent(
+    name="ragproxyagent",
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=10,
+    retrieve_config={
+        "task": "code",
+        "docs_path": "~/path/to/FLAML/website/docs/reference",  # change this to your own path, such as https://raw.githubusercontent.com/microsoft/autogen/main/README.md
+        "chunk_token_size": 2000,
+        "model": config_list[0]["model"],
+        "client": QdrantClient(":memory:"),
+        "embedding_model": "BAAI/bge-small-en-v1.5",
+    },
+)
+```
+
+<a id="example-1"></a>
+### Example 1
+
+[back to top](#toc)
+
+Use RetrieveChat to answer a question and ask for human-in-loop feedbacks.
+
+Problem: Is there a function named `tune_automl` in FLAML?
+
+
+```python
+# reset the assistant. Always reset the assistant before starting a new conversation.
+assistant.reset()
+
+qa_problem = "Is there a function called tune_automl?"
+ragproxyagent.initiate_chat(assistant, problem=qa_problem)
+```
+
+    [32mAdding doc_id 69 to context.[0m
+    [32mAdding doc_id 0 to context.[0m
+    [32mAdding doc_id 47 to context.[0m
+    [32mAdding doc_id 64 to context.[0m
+    [32mAdding doc_id 65 to context.[0m
+    [32mAdding doc_id 21 to context.[0m
+    [33mragproxyagent[0m (to assistant):
+    
+    You're a retrieve augmented coding assistant. You answer user's questions based on your own knowledge and the
+    context provided by the user.
+    If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+    For code generation, you must obey the following rules:
+    Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+    Rule 2. You must follow the formats below to write your code:
+    ```language
+    # your code
+    ```
+    
+    User's question is: Is there a function called tune_automl?
+    
+    Context is: {
+      "items": [
+        {
+          "items": [
+            {
+              "items": [
+                {
+                  "items": [
+                    "reference/autogen/agentchat/contrib/math_user_proxy_agent",
+                    "reference/autogen/agentchat/contrib/retrieve_assistant_agent",
+                    "reference/autogen/agentchat/contrib/retrieve_user_proxy_agent"
+                  ],
+                  "label": "autogen.agentchat.contrib",
+                  "type": "category"
+                },
+                "reference/autogen/agentchat/agent",
+                "reference/autogen/agentchat/assistant_agent",
+                "reference/autogen/agentchat/conversable_agent",
+                "reference/autogen/agentchat/groupchat",
+                "reference/autogen/agentchat/user_proxy_agent"
+              ],
+              "label": "autogen.agentchat",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/autogen/oai/completion",
+                "reference/autogen/oai/openai_utils"
+              ],
+              "label": "autogen.oai",
+              "type": "category"
+            },
+            "reference/autogen/code_utils",
+            "reference/autogen/math_utils",
+            "reference/autogen/retrieve_utils"
+          ],
+          "label": "autogen",
+          "type": "category"
+        },
+        {
+          "items": [
+            {
+              "items": [
+                {
+                  "items": [
+                    "reference/automl/nlp/huggingface/trainer",
+                    "reference/automl/nlp/huggingface/training_args",
+                    "reference/automl/nlp/huggingface/utils"
+                  ],
+                  "label": "automl.nlp.huggingface",
+                  "type": "category"
+                },
+                "reference/automl/nlp/utils"
+              ],
+              "label": "automl.nlp",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/spark/metrics",
+                "reference/automl/spark/utils"
+              ],
+              "label": "automl.spark",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/task/task",
+                "reference/automl/task/time_series_task"
+              ],
+              "label": "automl.task",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/time_series/sklearn",
+                "reference/automl/time_series/tft",
+                "reference/automl/time_series/ts_data",
+                "reference/automl/time_series/ts_model"
+              ],
+              "label": "automl.time_series",
+              "type": "category"
+            },
+            "reference/automl/automl",
+            "reference/automl/data",
+            "reference/automl/ml",
+            "reference/automl/model",
+            "reference/automl/state"
+          ],
+          "label": "automl",
+          "type": "category"
+        },
+        {
+          "items": [
+            "reference/default/estimator",
+            "reference/default/greedy",
+            "reference/default/portfolio",
+            "reference/default/suggest"
+          ],
+          "label": "default",
+          "type": "category"
+        },
+        {
+          "items": [
+            "reference/onlineml/autovw",
+            "reference/onlineml/trial",
+            "reference/onlineml/trial_runner"
+          ],
+          "label": "onlineml",
+          "type": "category"
+        },
+        {
+          "items": [
+            {
+              "items": [
+                "reference/tune/scheduler/online_scheduler",
+                "reference/tune/scheduler/trial_scheduler"
+              ],
+              "label": "tune.scheduler",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/tune/searcher/blendsearch",
+                "reference/tune/searcher/cfo_cat",
+                "reference/tune/searcher/flow2",
+                "reference/tune/searcher/online_searcher",
+                "reference/tune/searcher/search_thread",
+                "reference/tune/searcher/suggestion",
+                "reference/tune/searcher/variant_generator"
+              ],
+              "label": "tune.searcher",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/tune/spark/utils"
+              ],
+              "label": "tune.spark",
+              "type": "category"
+            },
+            "reference/tune/analysis",
+            "reference/tune/sample",
+            "reference/tune/space",
+            "reference/tune/trial",
+            "reference/tune/trial_runner",
+            "reference/tune/tune",
+            "reference/tune/utils"
+          ],
+          "label": "tune",
+          "type": "category"
+        },
+        "reference/config"
+      ],
+      "label": "Reference",
+      "type": "category"
+    }
+    ---
+    sidebar_label: config
+    title: config
+    ---
+    
+    !
+    * Copyright (c) Microsoft Corporation. All rights reserved.
+    * Licensed under the MIT License.
+    
+    #### PENALTY
+    
+    penalty term for constraints
+    
+    
+    ---
+    sidebar_label: trial_scheduler
+    title: tune.scheduler.trial_scheduler
+    ---
+    
+    ## TrialScheduler Objects
+    
+    ```python
+    class TrialScheduler()
+    ```
+    
+    Interface for implementing a Trial Scheduler class.
+    
+    #### CONTINUE
+    
+    Status for continuing trial execution
+    
+    #### PAUSE
+    
+    Status for pausing trial execution
+    
+    #### STOP
+    
+    Status for stopping trial execution
+    
+    
+    ---
+    sidebar_label: retrieve_user_proxy_agent
+    title: autogen.agentchat.contrib.retrieve_user_proxy_agent
+    ---
+    
+    ## RetrieveUserProxyAgent Objects
+    
+    ```python
+    class RetrieveUserProxyAgent(UserProxyAgent)
+    ```
+    
+    #### \_\_init\_\_
+    
+    ```python
+    def __init__(name="RetrieveChatAgent",
+                 is_termination_msg: Optional[Callable[
+                     [Dict], bool]] = _is_termination_msg_retrievechat,
+                 human_input_mode: Optional[str] = "ALWAYS",
+                 retrieve_config: Optional[Dict] = None,
+                 **kwargs)
+    ```
+    
+    **Arguments**:
+    
+    - `name` _str_ - name of the agent.
+    - `human_input_mode` _str_ - whether to ask for human inputs every time a message is received.
+      Possible values are "ALWAYS", "TERMINATE", "NEVER".
+      (1) When "ALWAYS", the agent prompts for human input every time a message is received.
+      Under this mode, the conversation stops when the human input is "exit",
+      or when is_termination_msg is True and there is no human input.
+      (2) When "TERMINATE", the agent only prompts for human input only when a termination message is received or
+      the number of auto reply reaches the max_consecutive_auto_reply.
+      (3) When "NEVER", the agent will never prompt for human input. Under this mode, the conversation stops
+      when the number of auto reply reaches the max_consecutive_auto_reply or when is_termination_msg is True.
+    - `retrieve_config` _dict or None_ - config for the retrieve agent.
+      To use default config, set to None. Otherwise, set to a dictionary with the following keys:
+      - task (Optional, str): the task of the retrieve chat. Possible values are "code", "qa" and "default". System
+      prompt will be different for different tasks. The default value is `default`, which supports both code and qa.
+      - client (Optional, chromadb.Client): the chromadb client.
+      If key not provided, a default client `chromadb.Client()` will be used.
+      - docs_path (Optional, str): the path to the docs directory. It can also be the path to a single file,
+      or the url to a single file. If key not provided, a default path `./docs` will be used.
+      - collection_name (Optional, str): the name of the collection.
+      If key not provided, a default name `flaml-docs` will be used.
+      - model (Optional, str): the model to use for the retrieve chat.
+      If key not provided, a default model `gpt-4` will be used.
+      - chunk_token_size (Optional, int): the chunk token size for the retrieve chat.
+      If key not provided, a default size `max_tokens * 0.4` will be used.
+      - context_max_tokens (Optional, int): the context max token size for the retrieve chat.
+      If key not provided, a default size `max_tokens * 0.8` will be used.
+      - chunk_mode (Optional, str): the chunk mode for the retrieve chat. Possible values are
+      "multi_lines" and "one_line". If key not provided, a default mode `multi_lines` will be used.
+      - must_break_at_empty_line (Optional, bool): chunk will only break at empty line if True. Default is True.
+      If chunk_mode is "one_line", this parameter will be ignored.
+      - embedding_model (Optional, str): the embedding model to use for the retrieve chat.
+      If key not provided, a default model `all-MiniLM-L6-v2` will be used. All available models
+      can be found at `https://www.sbert.net/docs/pretrained_models.html`. The default model is a
+      fast model. If you want to use a high performance model, `all-mpnet-base-v2` is recommended.
+      - customized_prompt (Optional, str): the customized prompt for the retrieve chat. Default is None.
+    - `**kwargs` _dict_ - other kwargs in [UserProxyAgent](user_proxy_agent#__init__).
+    
+    #### generate\_init\_message
+    
+    ```python
+    def generate_init_message(problem: str,
+                              n_results: int = 20,
+                              search_string: str = "")
+    ```
+    
+    Generate an initial message with the given problem and prompt.
+    
+    **Arguments**:
+    
+    - `problem` _str_ - the problem to be solved.
+    - `n_results` _int_ - the number of results to be retrieved.
+    - `search_string` _str_ - only docs containing this string will be retrieved.
+      
+    
+    **Returns**:
+    
+    - `str` - the generated prompt ready to be sent to the assistant agent.
+    
+    
+    ---
+    sidebar_label: retrieve_assistant_agent
+    title: autogen.agentchat.contrib.retrieve_assistant_agent
+    ---
+    
+    ## RetrieveAssistantAgent Objects
+    
+    ```python
+    class RetrieveAssistantAgent(AssistantAgent)
+    ```
+    
+    (Experimental) Retrieve Assistant agent, designed to solve a task with LLM.
+    
+    RetrieveAssistantAgent is a subclass of AssistantAgent configured with a default system message.
+    The default system message is designed to solve a task with LLM,
+    including suggesting python code blocks and debugging.
+    `human_input_mode` is default to "NEVER"
+    and `code_execution_config` is default to False.
+    This agent doesn't execute code by default, and expects the user to execute the code.
+    
+    
+    ---
+    sidebar_label: utils
+    title: automl.nlp.huggingface.utils
+    ---
+    
+    #### todf
+    
+    ```python
+    def todf(X, Y, column_name)
+    ```
+    
+    todf converts Y from any format (list, pandas.Series, numpy array) to a DataFrame before being returned
+    
+    
+    
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to ragproxyagent):
+    
+    No, there is no function called `tune_automl` in the given context.
+    
+    --------------------------------------------------------------------------------
+
+
+<a id="example-2"></a>
+### Example 2
+
+[back to top](#toc)
+
+Use RetrieveChat to answer a question that is not related to code generation.
+
+Problem: Who is the author of FLAML?
+
+
+```python
+# reset the assistant. Always reset the assistant before starting a new conversation.
+assistant.reset()
+
+qa_problem = "Who is the author of FLAML?"
+ragproxyagent.initiate_chat(assistant, problem=qa_problem)
+```
+
+    [32mAdding doc_id 0 to context.[0m
+    [32mAdding doc_id 21 to context.[0m
+    [32mAdding doc_id 47 to context.[0m
+    [32mAdding doc_id 35 to context.[0m
+    [32mAdding doc_id 41 to context.[0m
+    [32mAdding doc_id 69 to context.[0m
+    [32mAdding doc_id 34 to context.[0m
+    [32mAdding doc_id 22 to context.[0m
+    [32mAdding doc_id 51 to context.[0m
+    [33mragproxyagent[0m (to assistant):
+    
+    You're a retrieve augmented coding assistant. You answer user's questions based on your own knowledge and the
+    context provided by the user.
+    If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+    For code generation, you must obey the following rules:
+    Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+    Rule 2. You must follow the formats below to write your code:
+    ```language
+    # your code
+    ```
+    
+    User's question is: Who is the author of FLAML?
+    
+    Context is: ---
+    sidebar_label: config
+    title: config
+    ---
+    
+    !
+    * Copyright (c) Microsoft Corporation. All rights reserved.
+    * Licensed under the MIT License.
+    
+    #### PENALTY
+    
+    penalty term for constraints
+    
+    
+    ---
+    sidebar_label: utils
+    title: automl.nlp.huggingface.utils
+    ---
+    
+    #### todf
+    
+    ```python
+    def todf(X, Y, column_name)
+    ```
+    
+    todf converts Y from any format (list, pandas.Series, numpy array) to a DataFrame before being returned
+    
+    
+    ---
+    sidebar_label: trial_scheduler
+    title: tune.scheduler.trial_scheduler
+    ---
+    
+    ## TrialScheduler Objects
+    
+    ```python
+    class TrialScheduler()
+    ```
+    
+    Interface for implementing a Trial Scheduler class.
+    
+    #### CONTINUE
+    
+    Status for continuing trial execution
+    
+    #### PAUSE
+    
+    Status for pausing trial execution
+    
+    #### STOP
+    
+    Status for stopping trial execution
+    
+    
+    ---
+    sidebar_label: space
+    title: tune.space
+    ---
+    
+    #### is\_constant
+    
+    ```python
+    def is_constant(space: Union[Dict, List]) -> bool
+    ```
+    
+    Whether the search space is all constant.
+    
+    **Returns**:
+    
+      A bool of whether the search space is all constant.
+    
+    #### define\_by\_run\_func
+    
+    ```python
+    def define_by_run_func(trial,
+                           space: Dict,
+                           path: str = "") -> Optional[Dict[str, Any]]
+    ```
+    
+    Define-by-run function to create the search space.
+    
+    **Returns**:
+    
+      A dict with constant values.
+    
+    #### unflatten\_hierarchical
+    
+    ```python
+    def unflatten_hierarchical(config: Dict, space: Dict) -> Tuple[Dict, Dict]
+    ```
+    
+    Unflatten hierarchical config.
+    
+    #### add\_cost\_to\_space
+    
+    ```python
+    def add_cost_to_space(space: Dict, low_cost_point: Dict, choice_cost: Dict)
+    ```
+    
+    Update the space in place by adding low_cost_point and choice_cost.
+    
+    **Returns**:
+    
+      A dict with constant values.
+    
+    #### normalize
+    
+    ```python
+    def normalize(config: Dict,
+                  space: Dict,
+                  reference_config: Dict,
+                  normalized_reference_config: Dict,
+                  recursive: bool = False)
+    ```
+    
+    Normalize config in space according to reference_config.
+    
+    Normalize each dimension in config to [0,1].
+    
+    #### indexof
+    
+    ```python
+    def indexof(domain: Dict, config: Dict) -> int
+    ```
+    
+    Find the index of config in domain.categories.
+    
+    #### complete\_config
+    
+    ```python
+    def complete_config(partial_config: Dict,
+                        space: Dict,
+                        flow2,
+                        disturb: bool = False,
+                        lower: Optional[Dict] = None,
+                        upper: Optional[Dict] = None) -> Tuple[Dict, Dict]
+    ```
+    
+    Complete partial config in space.
+    
+    **Returns**:
+    
+      config, space.
+    
+    
+    ---
+    sidebar_label: search_thread
+    title: tune.searcher.search_thread
+    ---
+    
+    ## SearchThread Objects
+    
+    ```python
+    class SearchThread()
+    ```
+    
+    Class of global or local search thread.
+    
+    #### \_\_init\_\_
+    
+    ```python
+    def __init__(mode: str = "min",
+                 search_alg: Optional[Searcher] = None,
+                 cost_attr: Optional[str] = TIME_TOTAL_S,
+                 eps: Optional[float] = 1.0)
+    ```
+    
+    When search_alg is omitted, use local search FLOW2.
+    
+    #### suggest
+    
+    ```python
+    def suggest(trial_id: str) -> Optional[Dict]
+    ```
+    
+    Use the suggest() of the underlying search algorithm.
+    
+    #### on\_trial\_complete
+    
+    ```python
+    def on_trial_complete(trial_id: str,
+                          result: Optional[Dict] = None,
+                          error: bool = False)
+    ```
+    
+    Update the statistics of the thread.
+    
+    #### reach
+    
+    ```python
+    def reach(thread) -> bool
+    ```
+    
+    Whether the incumbent can reach the incumbent of thread.
+    
+    #### can\_suggest
+    
+    ```python
+    @property
+    def can_suggest() -> bool
+    ```
+    
+    Whether the thread can suggest new configs.
+    
+    
+    {
+      "items": [
+        {
+          "items": [
+            {
+              "items": [
+                {
+                  "items": [
+                    "reference/autogen/agentchat/contrib/math_user_proxy_agent",
+                    "reference/autogen/agentchat/contrib/retrieve_assistant_agent",
+                    "reference/autogen/agentchat/contrib/retrieve_user_proxy_agent"
+                  ],
+                  "label": "autogen.agentchat.contrib",
+                  "type": "category"
+                },
+                "reference/autogen/agentchat/agent",
+                "reference/autogen/agentchat/assistant_agent",
+                "reference/autogen/agentchat/conversable_agent",
+                "reference/autogen/agentchat/groupchat",
+                "reference/autogen/agentchat/user_proxy_agent"
+              ],
+              "label": "autogen.agentchat",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/autogen/oai/completion",
+                "reference/autogen/oai/openai_utils"
+              ],
+              "label": "autogen.oai",
+              "type": "category"
+            },
+            "reference/autogen/code_utils",
+            "reference/autogen/math_utils",
+            "reference/autogen/retrieve_utils"
+          ],
+          "label": "autogen",
+          "type": "category"
+        },
+        {
+          "items": [
+            {
+              "items": [
+                {
+                  "items": [
+                    "reference/automl/nlp/huggingface/trainer",
+                    "reference/automl/nlp/huggingface/training_args",
+                    "reference/automl/nlp/huggingface/utils"
+                  ],
+                  "label": "automl.nlp.huggingface",
+                  "type": "category"
+                },
+                "reference/automl/nlp/utils"
+              ],
+              "label": "automl.nlp",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/spark/metrics",
+                "reference/automl/spark/utils"
+              ],
+              "label": "automl.spark",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/task/task",
+                "reference/automl/task/time_series_task"
+              ],
+              "label": "automl.task",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/automl/time_series/sklearn",
+                "reference/automl/time_series/tft",
+                "reference/automl/time_series/ts_data",
+                "reference/automl/time_series/ts_model"
+              ],
+              "label": "automl.time_series",
+              "type": "category"
+            },
+            "reference/automl/automl",
+            "reference/automl/data",
+            "reference/automl/ml",
+            "reference/automl/model",
+            "reference/automl/state"
+          ],
+          "label": "automl",
+          "type": "category"
+        },
+        {
+          "items": [
+            "reference/default/estimator",
+            "reference/default/greedy",
+            "reference/default/portfolio",
+            "reference/default/suggest"
+          ],
+          "label": "default",
+          "type": "category"
+        },
+        {
+          "items": [
+            "reference/onlineml/autovw",
+            "reference/onlineml/trial",
+            "reference/onlineml/trial_runner"
+          ],
+          "label": "onlineml",
+          "type": "category"
+        },
+        {
+          "items": [
+            {
+              "items": [
+                "reference/tune/scheduler/online_scheduler",
+                "reference/tune/scheduler/trial_scheduler"
+              ],
+              "label": "tune.scheduler",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/tune/searcher/blendsearch",
+                "reference/tune/searcher/cfo_cat",
+                "reference/tune/searcher/flow2",
+                "reference/tune/searcher/online_searcher",
+                "reference/tune/searcher/search_thread",
+                "reference/tune/searcher/suggestion",
+                "reference/tune/searcher/variant_generator"
+              ],
+              "label": "tune.searcher",
+              "type": "category"
+            },
+            {
+              "items": [
+                "reference/tune/spark/utils"
+              ],
+              "label": "tune.spark",
+              "type": "category"
+            },
+            "reference/tune/analysis",
+            "reference/tune/sample",
+            "reference/tune/space",
+            "reference/tune/trial",
+            "reference/tune/trial_runner",
+            "reference/tune/tune",
+            "reference/tune/utils"
+          ],
+          "label": "tune",
+          "type": "category"
+        },
+        "reference/config"
+      ],
+      "label": "Reference",
+      "type": "category"
+    }
+    ---
+    sidebar_label: utils
+    title: tune.utils
+    ---
+    
+    #### choice
+    
+    ```python
+    def choice(categories: Sequence, order=None)
+    ```
+    
+    Sample a categorical value.
+    Sampling from ``tune.choice([1, 2])`` is equivalent to sampling from
+    ``np.random.choice([1, 2])``
+    
+    **Arguments**:
+    
+    - `categories` _Sequence_ - Sequence of categories to sample from.
+    - `order` _bool_ - Whether the categories have an order. If None, will be decided autoamtically:
+      Numerical categories have an order, while string categories do not.
+    
+    
+    ---
+    sidebar_label: trainer
+    title: automl.nlp.huggingface.trainer
+    ---
+    
+    ## TrainerForAuto Objects
+    
+    ```python
+    class TrainerForAuto(Seq2SeqTrainer)
+    ```
+    
+    #### evaluate
+    
+    ```python
+    def evaluate(eval_dataset=None, ignore_keys=None, metric_key_prefix="eval")
+    ```
+    
+    Overriding transformers.Trainer.evaluate by saving metrics and checkpoint path.
+    
+    
+    ---
+    sidebar_label: trial
+    title: onlineml.trial
+    ---
+    
+    #### get\_ns\_feature\_dim\_from\_vw\_example
+    
+    ```python
+    def get_ns_feature_dim_from_vw_example(vw_example) -> dict
+    ```
+    
+    Get a dictionary of feature dimensionality for each namespace singleton.
+    
+    ## OnlineResult Objects
+    
+    ```python
+    class OnlineResult()
+    ```
+    
+    Class for managing the result statistics of a trial.
+    
+    #### CB\_COEF
+    
+    0.001 for mse
+    
+    #### \_\_init\_\_
+    
+    ```python
+    def __init__(result_type_name: str,
+                 cb_coef: Optional[float] = None,
+                 init_loss: Optional[float] = 0.0,
+                 init_cb: Optional[float] = 100.0,
+                 mode: Optional[str] = "min",
+                 sliding_window_size: Optional[int] = 100)
+    ```
+    
+    Constructor.
+    
+    **Arguments**:
+    
+    - `result_type_name` - A String to specify the name of the result type.
+    - `cb_coef` - a string to specify the coefficient on the confidence bound.
+    - `init_loss` - a float to specify the inital loss.
+    - `init_cb` - a float to specify the intial confidence bound.
+    - `mode` - A string in ['min', 'max'] to specify the objective as
+      minimization or maximization.
+    - `sliding_window_size` - An int to specify the size of the sliding window
+      (for experimental purpose).
+    
+    #### update\_result
+    
+    ```python
+    def update_result(new_loss,
+                      new_resource_used,
+                      data_dimension,
+                      bound_of_range=1.0,
+                      new_observation_count=1.0)
+    ```
+    
+    Update result statistics.
+    
+    ## BaseOnlineTrial Objects
+    
+    ```python
+    class BaseOnlineTrial(Trial)
+    ```
+    
+    Class for the online trial.
+    
+    #### \_\_init\_\_
+    
+    ```python
+    def __init__(config: dict,
+                 min_resource_lease: float,
+                 is_champion: Optional[bool] = False,
+                 is_checked_under_current_champion: Optional[bool] = True,
+                 custom_trial_name: Optional[str] = "mae",
+                 trial_id: Optional[str] = None)
+    ```
+    
+    Constructor.
+    
+    **Arguments**:
+    
+    - `config` - The configuration dictionary.
+    - `min_resource_lease` - A float specifying the minimum resource lease.
+    - `is_champion` - A bool variable indicating whether the trial is champion.
+    - `is_checked_under_current_champion` - A bool indicating whether the trial
+      has been used under the current champion.
+    - `custom_trial_name` - A string of a custom trial name.
+    - `trial_id` - A string for the trial id.
+    
+    #### set\_resource\_lease
+    
+    ```python
+    def set_resource_lease(resource: float)
+    ```
+    
+    Sets the resource lease accordingly.
+    
+    #### set\_status
+    
+    ```python
+    def set_status(status)
+    ```
+    
+    Sets the status of the trial and record the start time.
+    
+    ## VowpalWabbitTrial Objects
+    
+    ```python
+    class VowpalWabbitTrial(BaseOnlineTrial)
+    ```
+    
+    The class for Vowpal Wabbit online trials.
+    
+    #### \_\_init\_\_
+    
+    ```python
+    def __init__(config: dict,
+                 min_resource_lease: float,
+                 metric: str = "mae",
+                 is_champion: Optional[bool] = False,
+                 is_checked_under_current_champion: Optional[bool] = True,
+                 custom_trial_name: Optional[str] = "vw_mae_clipped",
+                 trial_id: Optional[str] = None,
+                 cb_coef: Optional[float] = None)
+    ```
+    
+    Constructor.
+    
+    **Arguments**:
+    
+    - `config` _dict_ - the config of the trial (note that the config is a set
+      because the hyperparameters are).
+    - `min_resource_lease` _float_ - the minimum resource lease.
+    - `metric` _str_ - the loss metric.
+    - `is_champion` _bool_ - indicates whether the trial is the current champion or not.
+    - `is_checked_under_current_champion` _bool_ - indicates whether this trials has
+      been paused under the current champion.
+    - `trial_id` _str_ - id of the trial (if None, it will be generated in the constructor).
+    
+    #### train\_eval\_model\_online
+    
+    ```python
+    def train_eval_model_online(data_sample, y_pred)
+    ```
+    
+    Train and evaluate model online.
+    
+    #### predict
+    
+    ```python
+    def predict(x)
+    ```
+    
+    Predict using the model.
+    
+    
+    
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to ragproxyagent):
+    
+    The author of FLAML is Microsoft Corporation.
+    
+    --------------------------------------------------------------------------------
+

@@ -1,0 +1,136 @@
+## OpenAI Assistants in AutoGen
+
+This notebook shows a very basic example of the [`GPTAssistantAgent`](https://github.com/microsoft/autogen/blob/main/autogen/agentchat/contrib/gpt_assistant_agent.py#L16C43-L16C43), which is an experimental AutoGen agent class that leverages the [OpenAI Assistant API](https://platform.openai.com/docs/assistants/overview) for conversational capabilities,  working with
+`UserProxyAgent` in AutoGen.
+
+
+```python
+import logging
+import os
+ 
+from autogen import config_list_from_json
+from autogen import AssistantAgent
+from autogen.agentchat.contrib.gpt_assistant_agent import GPTAssistantAgent
+from autogen import UserProxyAgent
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
+assistant_id = os.environ.get("ASSISTANT_ID", None)
+
+config_list = config_list_from_json("OAI_CONFIG_LIST")
+llm_config = {
+    "config_list": config_list,
+    "assistant_id": assistant_id
+}
+
+gpt_assistant = GPTAssistantAgent(name="assistant",
+                                instructions=AssistantAgent.DEFAULT_SYSTEM_MESSAGE,
+                                llm_config=llm_config)
+
+user_proxy = UserProxyAgent(name="user_proxy",
+    code_execution_config={
+        "work_dir": "coding"
+    },
+    is_termination_msg=lambda msg: "TERMINATE" in msg["content"],
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=1)
+user_proxy.initiate_chat(gpt_assistant, message="Print hello world")
+```
+
+    assistant_id was None, creating a new assistant
+
+
+    [33muser_proxy[0m (to assistant):
+    
+    Print hello world
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    ```python
+    print("Hello, World!")
+    ```
+    
+    Please run this Python code to print "Hello, World!" to the console.
+    
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    Hello, World!
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    The code executed successfully and printed "Hello, World!" as expected.
+    
+    TERMINATE
+    
+    
+    --------------------------------------------------------------------------------
+
+
+
+```python
+user_proxy.initiate_chat(gpt_assistant, message="Write py code to eval 2 + 2", clear_history=True)
+```
+
+    [33muser_proxy[0m (to assistant):
+    
+    Write py code to eval 2 + 2
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    ```python
+    # Let's write a simple Python code to evaluate 2 + 2 and print the result.
+    
+    result = 2 + 2
+    print(result)
+    ```
+    
+    
+    --------------------------------------------------------------------------------
+    [31m
+    >>>>>>>> EXECUTING CODE BLOCK 0 (inferred language is python)...[0m
+
+
+    execute_code was called without specifying a value for use_docker. Since the python docker package is not available, code will be run natively. Note: this fallback behavior is subject to change
+
+
+    [33muser_proxy[0m (to assistant):
+    
+    exitcode: 0 (execution succeeded)
+    Code output: 
+    4
+    
+    
+    --------------------------------------------------------------------------------
+    [33massistant[0m (to user_proxy):
+    
+    The Python code was executed successfully and the result of evaluating 2 + 2 is 4.
+    
+    TERMINATE
+    
+    
+    --------------------------------------------------------------------------------
+
+
+
+```python
+gpt_assistant.delete_assistant()
+```
+
+    Permanently deleting assistant...
+

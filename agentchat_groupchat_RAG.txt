@@ -1,0 +1,669 @@
+<a href="https://colab.research.google.com/github/microsoft/autogen/blob/main/notebook/agentchat_groupchat_RAG.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+
+# Auto Generated Agent Chat: Group Chat with Retrieval Augmented Generation
+
+AutoGen supports conversable agents powered by LLMs, tools or humans, performing tasks collectively via automated chat. This framework allows tool use and human participation through multi-agent conversation.
+Please find documentation about this feature [here](https://microsoft.github.io/autogen/docs/Use-Cases/agent_chat).
+
+## Requirements
+
+AutoGen requires `Python>=3.8`. To run this notebook example, please install:
+```bash
+pip install "pyautogen[retrievechat]~=0.2.0b5"
+```
+
+
+```python
+%%capture --no-stderr
+# %pip install "pyautogen[retrievechat]~=0.2.0b5"
+```
+
+## Set your API Endpoint
+
+The [`config_list_from_json`](https://microsoft.github.io/autogen/docs/reference/oai/openai_utils#config_list_from_json) function loads a list of configurations from an environment variable or a json file.
+
+
+```python
+import autogen
+
+config_list = autogen.config_list_from_json(
+    "OAI_CONFIG_LIST",
+    file_location=".",
+    filter_dict={
+        "model": ["gpt-3.5-turbo", "gpt-35-turbo", "gpt-35-turbo-0613", "gpt-4", "gpt4", "gpt-4-32k"],
+    },
+)
+
+print("LLM models: ", [config_list[i]["model"] for i in range(len(config_list))])
+```
+
+    LLM models:  ['gpt-35-turbo', 'gpt-35-turbo-0613']
+
+
+It first looks for environment variable "OAI_CONFIG_LIST" which needs to be a valid json string. If that variable is not found, it then looks for a json file named "OAI_CONFIG_LIST". It filters the configs by models (you can filter by other keys as well).
+
+The config list looks like the following:
+```python
+config_list = [
+    {
+        "model": "gpt-4",
+        "api_key": "<your OpenAI API key>",
+    },  # OpenAI API endpoint for gpt-4
+    {
+        "model": "gpt-35-turbo-0631",  # 0631 or newer is needed to use functions
+        "base_url": "<your Azure OpenAI API base>", 
+        "api_type": "azure", 
+        "api_version": "2023-08-01-preview", # 2023-07-01-preview or newer is needed to use functions
+        "api_key": "<your Azure OpenAI API key>"
+    }
+]
+```
+
+You can set the value of config_list in any way you prefer. Please refer to this [notebook](https://github.com/microsoft/autogen/blob/main/notebook/oai_openai_utils.ipynb) for full code examples of the different methods.
+
+## Construct Agents
+
+
+```python
+from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
+from autogen import AssistantAgent
+import chromadb
+
+llm_config = {
+    "timeout": 60,
+    "cache_seed": 42,
+    "config_list": config_list,
+    "temperature": 0,
+}
+
+# autogen.ChatCompletion.start_logging()
+termination_msg = lambda x: isinstance(x, dict) and "TERMINATE" == str(x.get("content", ""))[-9:].upper()
+
+boss = autogen.UserProxyAgent(
+    name="Boss",
+    is_termination_msg=termination_msg,
+    human_input_mode="NEVER",
+    system_message="The boss who ask questions and give tasks.",
+    code_execution_config=False,  # we don't want to execute code in this case.
+    default_auto_reply="Reply `TERMINATE` if the task is done.",
+)
+
+boss_aid = RetrieveUserProxyAgent(
+    name="Boss_Assistant",
+    is_termination_msg=termination_msg,
+    system_message="Assistant who has extra content retrieval power for solving difficult problems.",
+    human_input_mode="NEVER",
+    max_consecutive_auto_reply=3,
+    retrieve_config={
+        "task": "code",
+        "docs_path": "https://raw.githubusercontent.com/microsoft/FLAML/main/website/docs/Examples/Integrate%20-%20Spark.md",
+        "chunk_token_size": 1000,
+        "model": config_list[0]["model"],
+        "client": chromadb.PersistentClient(path="/tmp/chromadb"),
+        "collection_name": "groupchat",
+        "get_or_create": True,
+    },
+    code_execution_config=False,  # we don't want to execute code in this case.
+)
+
+coder = AssistantAgent(
+    name="Senior_Python_Engineer",
+    is_termination_msg=termination_msg,
+    system_message="You are a senior python engineer. Reply `TERMINATE` in the end when everything is done.",
+    llm_config=llm_config,
+)
+
+pm = autogen.AssistantAgent(
+    name="Product_Manager",
+    is_termination_msg=termination_msg,
+    system_message="You are a product manager. Reply `TERMINATE` in the end when everything is done.",
+    llm_config=llm_config,
+)
+
+reviewer = autogen.AssistantAgent(
+    name="Code_Reviewer",
+    is_termination_msg=termination_msg,
+    system_message="You are a code reviewer. Reply `TERMINATE` in the end when everything is done.",
+    llm_config=llm_config,
+)
+
+PROBLEM = "How to use spark for parallel training in FLAML? Give me sample code."
+
+
+def _reset_agents():
+    boss.reset()
+    boss_aid.reset()
+    coder.reset()
+    pm.reset()
+    reviewer.reset()
+
+
+def rag_chat():
+    _reset_agents()
+    groupchat = autogen.GroupChat(
+        agents=[boss_aid, coder, pm, reviewer], messages=[], max_round=12, speaker_selection_method="round_robin"
+    )
+    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
+
+    # Start chatting with boss_aid as this is the user proxy agent.
+    boss_aid.initiate_chat(
+        manager,
+        problem=PROBLEM,
+        n_results=3,
+    )
+
+
+def norag_chat():
+    _reset_agents()
+    groupchat = autogen.GroupChat(
+        agents=[boss, coder, pm, reviewer],
+        messages=[],
+        max_round=12,
+        speaker_selection_method="auto",
+        allow_repeat_speaker=False,
+    )
+    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
+
+    # Start chatting with boss as this is the user proxy agent.
+    boss.initiate_chat(
+        manager,
+        message=PROBLEM,
+    )
+
+
+def call_rag_chat():
+    _reset_agents()
+
+    # In this case, we will have multiple user proxy agents and we don't initiate the chat
+    # with RAG user proxy agent.
+    # In order to use RAG user proxy agent, we need to wrap RAG agents in a function and call
+    # it from other agents.
+    def retrieve_content(message, n_results=3):
+        boss_aid.n_results = n_results  # Set the number of results to be retrieved.
+        # Check if we need to update the context.
+        update_context_case1, update_context_case2 = boss_aid._check_update_context(message)
+        if (update_context_case1 or update_context_case2) and boss_aid.update_context:
+            boss_aid.problem = message if not hasattr(boss_aid, "problem") else boss_aid.problem
+            _, ret_msg = boss_aid._generate_retrieve_user_reply(message)
+        else:
+            ret_msg = boss_aid.generate_init_message(message, n_results=n_results)
+        return ret_msg if ret_msg else message
+
+    boss_aid.human_input_mode = "NEVER"  # Disable human input for boss_aid since it only retrieves content.
+
+    llm_config = {
+        "functions": [
+            {
+                "name": "retrieve_content",
+                "description": "retrieve content for code generation and question answering.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Refined message which keeps the original meaning and can be used to retrieve content for code generation and question answering.",
+                        }
+                    },
+                    "required": ["message"],
+                },
+            },
+        ],
+        "config_list": config_list,
+        "timeout": 60,
+        "cache_seed": 42,
+    }
+
+    for agent in [coder, pm, reviewer]:
+        # update llm_config for assistant agents.
+        agent.llm_config.update(llm_config)
+
+    for agent in [boss, coder, pm, reviewer]:
+        # register functions for all agents.
+        agent.register_function(
+            function_map={
+                "retrieve_content": retrieve_content,
+            }
+        )
+
+    groupchat = autogen.GroupChat(
+        agents=[boss, coder, pm, reviewer],
+        messages=[],
+        max_round=12,
+        speaker_selection_method="random",
+        allow_repeat_speaker=False,
+    )
+    manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
+
+    # Start chatting with boss as this is the user proxy agent.
+    boss.initiate_chat(
+        manager,
+        message=PROBLEM,
+    )
+```
+
+    /home/lijiang1/anaconda3/envs/autogen/lib/python3.10/site-packages/tqdm/auto.py:21: TqdmWarning: IProgress not found. Please update jupyter and ipywidgets. See https://ipywidgets.readthedocs.io/en/stable/user_install.html
+      from .autonotebook import tqdm as notebook_tqdm
+    /home/lijiang1/anaconda3/envs/autogen/lib/python3.10/site-packages/torch/cuda/__init__.py:138: UserWarning: CUDA initialization: The NVIDIA driver on your system is too old (found version 11060). Please update your GPU driver by downloading and installing a new version from the URL: http://www.nvidia.com/Download/index.aspx Alternatively, go to: https://pytorch.org to install a PyTorch version that has been compiled with your version of the CUDA driver. (Triggered internally at ../c10/cuda/CUDAFunctions.cpp:108.)
+      return torch._C._cuda_getDeviceCount() > 0
+
+
+## Start Chat
+
+### UserProxyAgent doesn't get the correct code
+[FLAML](https://github.com/microsoft/FLAML) was open sourced in 2020, so ChatGPT is familiar with it. However, Spark-related APIs were added in 2022, so they were not in ChatGPT's training data. As a result, we end up with invalid code.
+
+
+```python
+norag_chat()
+```
+
+    [33mBoss[0m (to chat_manager):
+    
+    How to use spark for parallel training in FLAML? Give me sample code.
+    
+    --------------------------------------------------------------------------------
+    [33mSenior_Python_Engineer[0m (to chat_manager):
+    
+    To use Spark for parallel training in FLAML, you can use the `SparkTrials` class provided by FLAML. Here is a sample code:
+    
+    ```python
+    from flaml import AutoML
+    from flaml.data import load_credit
+    from flaml.model import SparkTrials
+    
+    # Load data
+    X_train, y_train, X_test, y_test = load_credit()
+    
+    # Define the search space
+    search_space = {
+        "n_estimators": {"domain": range(10, 100)},
+        "max_depth": {"domain": range(6, 10)},
+        "learning_rate": {"domain": (0.01, 0.1, 1)},
+    }
+    
+    # Create an AutoML instance with SparkTrials
+    automl = AutoML(
+        search_space=search_space,
+        task="classification",
+        n_jobs=1,
+        ensemble_size=0,
+        max_trials=10,
+        trials=SparkTrials(parallelism=2),
+    )
+    
+    # Train the model
+    automl.fit(X_train=X_train, y_train=y_train)
+    
+    # Evaluate the model
+    print("Best model:", automl.best_model)
+    print("Best hyperparameters:", automl.best_config)
+    print("Test accuracy:", automl.score(X_test=X_test, y_test=y_test))
+    
+    # Terminate
+    TERMINATE
+    ```
+    
+    In this code, we first load the credit dataset. Then, we define the search space for the hyperparameters. We create an `AutoML` instance with `SparkTrials` as the `trials` parameter. We set the `parallelism` parameter to 2, which means that FLAML will use 2 Spark workers to run the trials in parallel. Finally, we fit the model and evaluate it.
+    
+    --------------------------------------------------------------------------------
+    [33mCode_Reviewer[0m (to chat_manager):
+    
+    Great! That's a clear and concise example. No further questions from my side.
+    
+    --------------------------------------------------------------------------------
+    [33mProduct_Manager[0m (to chat_manager):
+    
+    Thank you! Let me know if you have any other questions.
+    
+    --------------------------------------------------------------------------------
+    [33mBoss[0m (to chat_manager):
+    
+    Reply `TERMINATE` if the task is done.
+    
+    --------------------------------------------------------------------------------
+
+
+    GroupChat select_speaker failed to resolve the next speaker's name. Speaker selection will default to the next speaker in the list. This is because the speaker selection OAI call returned:
+    The next role to play is not specified in the conversation. Please provide more information.
+
+
+    [33mSenior_Python_Engineer[0m (to chat_manager):
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
+
+### RetrieveUserProxyAgent get the correct code
+Since RetrieveUserProxyAgent can perform retrieval-augmented generation based on the given documentation file, ChatGPT can generate the correct code for us!
+
+
+```python
+rag_chat()
+# type exit to terminate the chat
+```
+
+    Trying to create collection.
+
+
+    Number of requested results 3 is greater than number of elements in index 2, updating n_results = 2
+
+
+    doc_ids:  [['doc_0', 'doc_1']]
+    [32mAdding doc_id doc_0 to context.[0m
+    [32mAdding doc_id doc_1 to context.[0m
+    [33mBoss_Assistant[0m (to chat_manager):
+    
+    You're a retrieve augmented coding assistant. You answer user's questions based on your own knowledge and the
+    context provided by the user.
+    If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+    For code generation, you must obey the following rules:
+    Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+    Rule 2. You must follow the formats below to write your code:
+    ```language
+    # your code
+    ```
+    
+    User's question is: How to use spark for parallel training in FLAML? Give me sample code.
+    
+    Context is: # Integrate - Spark
+    
+    FLAML has integrated Spark for distributed training. There are two main aspects of integration with Spark:
+    - Use Spark ML estimators for AutoML.
+    - Use Spark to run training in parallel spark jobs.
+    
+    ## Spark ML Estimators
+    
+    FLAML integrates estimators based on Spark ML models. These models are trained in parallel using Spark, so we called them Spark estimators. To use these models, you first need to organize your data in the required format.
+    
+    ### Data
+    
+    For Spark estimators, AutoML only consumes Spark data. FLAML provides a convenient function `to_pandas_on_spark` in the `flaml.automl.spark.utils` module to convert your data into a pandas-on-spark (`pyspark.pandas`) dataframe/series, which Spark estimators require.
+    
+    This utility function takes data in the form of a `pandas.Dataframe` or `pyspark.sql.Dataframe` and converts it into a pandas-on-spark dataframe. It also takes `pandas.Series` or `pyspark.sql.Dataframe` and converts it into a [pandas-on-spark](https://spark.apache.org/docs/latest/api/python/user_guide/pandas_on_spark/index.html) series. If you pass in a `pyspark.pandas.Dataframe`, it will not make any changes.
+    
+    This function also accepts optional arguments `index_col` and `default_index_type`.
+    - `index_col` is the column name to use as the index, default is None.
+    - `default_index_type` is the default index type, default is "distributed-sequence". More info about default index type could be found on Spark official [documentation](https://spark.apache.org/docs/latest/api/python/user_guide/pandas_on_spark/options.html#default-index-type)
+    
+    Here is an example code snippet for Spark Data:
+    
+    ```python
+    import pandas as pd
+    from flaml.automl.spark.utils import to_pandas_on_spark
+    # Creating a dictionary
+    data = {"Square_Feet": [800, 1200, 1800, 1500, 850],
+          "Age_Years": [20, 15, 10, 7, 25],
+          "Price": [100000, 200000, 300000, 240000, 120000]}
+    
+    # Creating a pandas DataFrame
+    dataframe = pd.DataFrame(data)
+    label = "Price"
+    
+    # Convert to pandas-on-spark dataframe
+    psdf = to_pandas_on_spark(dataframe)
+    ```
+    
+    To use Spark ML models you need to format your data appropriately. Specifically, use [`VectorAssembler`](https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.ml.feature.VectorAssembler.html) to merge all feature columns into a single vector column.
+    
+    Here is an example of how to use it:
+    ```python
+    from pyspark.ml.feature import VectorAssembler
+    columns = psdf.columns
+    feature_cols = [col for col in columns if col != label]
+    featurizer = VectorAssembler(inputCols=feature_cols, outputCol="features")
+    psdf = featurizer.transform(psdf.to_spark(index_col="index"))["index", "features"]
+    ```
+    
+    Later in conducting the experiment, use your pandas-on-spark data like non-spark data and pass them using `X_train, y_train` or `dataframe, label`.
+    
+    ### Estimators
+    #### Model List
+    - `lgbm_spark`: The class for fine-tuning Spark version LightGBM models, using [SynapseML](https://microsoft.github.io/SynapseML/docs/features/lightgbm/about/) API.
+    
+    #### Usage
+    First, prepare your data in the required format as described in the previous section.
+    
+    By including the models you intend to try in the `estimators_list` argument to `flaml.automl`, FLAML will start trying configurations for these models. If your input is Spark data, FLAML will also use estimators with the `_spark` postfix by default, even if you haven't specified them.
+    
+    Here is an example code snippet using SparkML models in AutoML:
+    
+    ```python
+    import flaml
+    # prepare your data in pandas-on-spark format as we previously mentioned
+    
+    automl = flaml.AutoML()
+    settings = {
+        "time_budget": 30,
+        "metric": "r2",
+        "estimator_list": ["lgbm_spark"],  # this setting is optional
+        "task": "regression",
+    }
+    
+    automl.fit(
+        dataframe=psdf,
+        label=label,
+        **settings,
+    )
+    ```
+    
+    
+    [Link to notebook](https://github.com/microsoft/FLAML/blob/main/notebook/automl_bankrupt_synapseml.ipynb) | [Open in colab](https://colab.research.google.com/github/microsoft/FLAML/blob/main/notebook/automl_bankrupt_synapseml.ipynb)
+    
+    ## Parallel Spark Jobs
+    You can activate Spark as the parallel backend during parallel tuning in both [AutoML](/docs/Use-Cases/Task-Oriented-AutoML#parallel-tuning) and [Hyperparameter Tuning](/docs/Use-Cases/Tune-User-Defined-Function#parallel-tuning), by setting the `use_spark` to `true`. FLAML will dispatch your job to the distributed Spark backend using [`joblib-spark`](https://github.com/joblib/joblib-spark).
+    
+    Please note that you should not set `use_spark` to `true` when applying AutoML and Tuning for Spark Data. This is because only SparkML models will be used for Spark Data in AutoML and Tuning. As SparkML models run in parallel, there is no need to distribute them with `use_spark` again.
+    
+    All the Spark-related arguments are stated below. These arguments are available in both Hyperparameter Tuning and AutoML:
+    
+    
+    - `use_spark`: boolean, default=False | Whether to use spark to run the training in parallel spark jobs. This can be used to accelerate training on large models and large datasets, but will incur more overhead in time and thus slow down training in some cases. GPU training is not supported yet when use_spark is True. For Spark clusters, by default, we will launch one trial per executor. However, sometimes we want to launch more trials than the number of executors (e.g., local mode). In this case, we can set the environment variable `FLAML_MAX_CONCURRENT` to override the detected `num_executors`. The final number of concurrent trials will be the minimum of `n_concurrent_trials` and `num_executors`.
+    - `n_concurrent_trials`: int, default=1 | The number of concurrent trials. When n_concurrent_trials > 1, FLAML performes parallel tuning.
+    - `force_cancel`: boolean, default=False | Whether to forcely cancel Spark jobs if the search time exceeded the time budget. Spark jobs include parallel tuning jobs and Spark-based model training jobs.
+    
+    An example code snippet for using parallel Spark jobs:
+    ```python
+    import flaml
+    automl_experiment = flaml.AutoML()
+    automl_settings = {
+        "time_budget": 30,
+        "metric": "r2",
+        "task": "regression",
+        "n_concurrent_trials": 2,
+        "use_spark": True,
+        "force_cancel": True, # Activating the force_cancel option can immediately halt Spark jobs once they exceed the allocated time_budget.
+    }
+    
+    automl.fit(
+        dataframe=dataframe,
+        label=label,
+        **automl_settings,
+    )
+    ```
+    
+    
+    [Link to notebook](https://github.com/microsoft/FLAML/blob/main/notebook/integrate_spark.ipynb) | [Open in colab](https://colab.research.google.com/github/microsoft/FLAML/blob/main/notebook/integrate_spark.ipynb)
+    
+    
+    
+    
+    --------------------------------------------------------------------------------
+    [33mSenior_Python_Engineer[0m (to chat_manager):
+    
+    To use Spark for parallel training in FLAML, you can activate Spark as the parallel backend during parallel tuning in both AutoML and Hyperparameter Tuning, by setting the `use_spark` to `true`. FLAML will dispatch your job to the distributed Spark backend using `joblib-spark`. Here is an example code snippet for using parallel Spark jobs:
+    
+    ```python
+    import flaml
+    automl_experiment = flaml.AutoML()
+    automl_settings = {
+        "time_budget": 30,
+        "metric": "r2",
+        "task": "regression",
+        "n_concurrent_trials": 2,
+        "use_spark": True,
+        "force_cancel": True, # Activating the force_cancel option can immediately halt Spark jobs once they exceed the allocated time_budget.
+    }
+    
+    automl.fit(
+        dataframe=dataframe,
+        label=label,
+        **automl_settings,
+    )
+    ```
+    
+    Note that you should not set `use_spark` to `true` when applying AutoML and Tuning for Spark Data. This is because only SparkML models will be used for Spark Data in AutoML and Tuning. As SparkML models run in parallel, there is no need to distribute them with `use_spark` again.
+    
+    I hope this helps! Let me know if you have any further questions.
+    
+    --------------------------------------------------------------------------------
+    [33mProduct_Manager[0m (to chat_manager):
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
+
+### Call RetrieveUserProxyAgent while init chat with another user proxy agent
+Sometimes, there might be a need to use RetrieveUserProxyAgent in group chat without initializing the chat with it. In such scenarios, it becomes essential to create a function that wraps the RAG agents and allows them to be called from other agents.
+
+
+```python
+call_rag_chat()
+```
+
+    [33mBoss[0m (to chat_manager):
+    
+    How to use spark for parallel training in FLAML? Give me sample code.
+    
+    --------------------------------------------------------------------------------
+    [33mProduct_Manager[0m (to chat_manager):
+    
+    To use Spark for parallel training in FLAML, you can follow these steps:
+    
+    1. Install PySpark and FLAML on your machine.
+    2. Start a Spark cluster using the `pyspark` command.
+    3. Import the necessary libraries and initialize a SparkSession object.
+    4. Load your data into a Spark DataFrame.
+    5. Define your search space and search strategy using FLAML's API.
+    6. Create a SparkEstimator object and pass it to FLAML's `fit()` method.
+    
+    Here's some sample code to get you started:
+    
+    ```python
+    from pyspark.sql import SparkSession
+    from flaml import AutoML
+    from flaml.data import get_output_from_log
+    
+    # Initialize a SparkSession object
+    spark = SparkSession.builder.appName("FLAML-Spark").getOrCreate()
+    
+    # Load your data into a Spark DataFrame
+    data = spark.read.format("csv").option("header", "true").load("path/to/data.csv")
+    
+    # Define your search space and search strategy
+    search_space = {
+        "n_estimators": {"domain": range(10, 100)},
+        "max_depth": {"domain": range(1, 10)},
+        "learning_rate": {"domain": [0.001, 0.01, 0.1]},
+    }
+    search_strategy = "skopt"
+    
+    # Create a SparkEstimator object
+    from pyspark.ml.classification import GBTClassifier
+    estimator = GBTClassifier()
+    
+    # Pass the SparkEstimator object to FLAML's fit() method
+    automl = AutoML()
+    automl.fit(
+        X_train=data,
+        estimator=estimator,
+        task="classification",
+        search_space=search_space,
+        search_alg=search_strategy,
+        n_jobs=-1,
+    )
+    
+    # Get the best model and its hyperparameters
+    best_model = automl.model
+    best_params = automl.best_config
+    
+    # Print the results
+    print(f"Best model: {best_model}")
+    print(f"Best hyperparameters: {best_params}")
+    
+    # Stop the SparkSession object
+    spark.stop()
+    ```
+    
+    Note that the `n_jobs` parameter is set to `-1` to use all available cores on the Spark cluster. You can adjust this value to control the level of parallelism. Also, the `get_output_from_log()` function can be used to extract the results from the FLAML log file. 
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+    To use Spark for parallel training in FLAML, you can follow these steps:
+    
+    1. Install PySpark and FLAML on your machine.
+    2. Start a Spark cluster using the `pyspark` command.
+    3. Import the necessary libraries and initialize a SparkSession object.
+    4. Load your data into a Spark DataFrame.
+    5. Define your search space and search strategy using FLAML's API.
+    6. Create a SparkEstimator object and pass it to FLAML's `fit()` method.
+    
+    Here's some sample code to get you started:
+    
+    ```python
+    from pyspark.sql import SparkSession
+    from flaml import AutoML
+    from flaml.data import get_output_from_log
+    
+    # Initialize a SparkSession object
+    spark = SparkSession.builder.appName("FLAML-Spark").getOrCreate()
+    
+    # Load your data into a Spark DataFrame
+    data = spark.read.format("csv").option("header", "true").load("path/to/data.csv")
+    
+    # Define your search space and search strategy
+    search_space = {
+        "n_estimators": {"domain": range(10, 100)},
+        "max_depth": {"domain": range(1, 10)},
+        "learning_rate": {"domain": [0.001, 0.01, 0.1]},
+    }
+    search_strategy = "skopt"
+    
+    # Create a SparkEstimator object
+    from pyspark.ml.classification import GBTClassifier
+    estimator = GBTClassifier()
+    
+    # Pass the SparkEstimator object to FLAML's fit() method
+    automl = AutoML()
+    automl.fit(
+        X_train=data,
+        estimator=estimator,
+        task="classification",
+        search_space=search_space,
+        search_alg=search_strategy,
+        n_jobs=-1,
+    )
+    
+    # Get the best model and its hyperparameters
+    best_model = automl.model
+    best_params = automl.best_config
+    
+    # Print the results
+    print(f"Best model: {best_model}")
+    print(f"Best hyperparameters: {best_params}")
+    
+    # Stop the SparkSession object
+    spark.stop()
+    ```
+    
+    Note that the `n_jobs` parameter is set to `-1` to use all available cores on the Spark cluster. You can adjust this value to control the level of parallelism. Also, the `get_output_from_log()` function can be used to extract the results from the FLAML log file. 
+    
+    TERMINATE
+    
+    --------------------------------------------------------------------------------
+
